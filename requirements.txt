@@ -1,0 +1,4 @@
+# Full FluxThemis dependency set.
+-r requirements-base.txt
+-r requirements-sim.txt
+-r requirements-real.txt
