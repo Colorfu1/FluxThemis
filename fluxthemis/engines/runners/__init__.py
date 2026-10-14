@@ -1,3 +1,3 @@
-from .eval_runner import EvalRunner
+from .evaluation import EvaluationRun, EvaluationSettings, EvaluationStatus
 
-__all__ = ['EvalRunner']
+__all__ = ['EvaluationRun', 'EvaluationSettings', 'EvaluationStatus']
