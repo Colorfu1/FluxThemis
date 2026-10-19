@@ -4,8 +4,11 @@ import argparse
 import contextlib
 import io
 import os
+import re
 import shutil
+import signal
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from numbers import Integral
@@ -18,6 +21,7 @@ from fluxthemis.engines.utils import ENVIRONMENTS
 from fluxthemis.structures import StepResult, TaskSpec
 
 from ..base import BaseEnvironment, EnvironmentCaseRejected
+from .robodojo_log_capture import FileLogCapture
 
 ROBODOJO_BENCHMARK = 'RoboDojo'
 ROBODOJO_DEFAULT_ROOT = '/root/projects/RoboDojo'
@@ -257,6 +261,44 @@ class _PostlaunchRuntime:
     task_registry: Any
 
 
+class _WorkerAppSignals:
+    """Skip only the legacy IsaacLab abort callback registrations.
+
+    IsaacLab #7774 / PR #8068: calling Kit.close() from Python fatal-signal
+    handlers can recurse or hang. Do not reset signals after launching Kit:
+    that also removes its native crash reporter (invisible to getsignal()).
+    """
+
+    def __init__(self, abort_callback: Any) -> None:
+        self.abort_callback = abort_callback
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(signal, name)
+
+    def signal(self, signum: int, handler: Any) -> Any:
+        if (signum in (signal.SIGSEGV, signal.SIGABRT, signal.SIGTERM)
+                and getattr(handler, '__func__', None) is self.abort_callback):
+            return signal.getsignal(signum)
+        return signal.signal(signum, handler)
+
+
+def _launch_worker_app(launcher: Any, args: argparse.Namespace) -> Any:
+    callback = getattr(launcher, '_abort_signal_handle_callback', None)
+    if callback is None:
+        return launcher(args)
+    module = sys.modules[launcher.__module__]
+    if getattr(module, 'signal', None) is not signal:
+        raise RuntimeError('Unsupported IsaacLab signal registration; '
+                           'review AppLauncher before starting workers')
+    # Only this module's reference is replaced, only during construction.
+    # Other modules and Kit can still register their own native handlers.
+    module.signal = _WorkerAppSignals(callback)
+    try:
+        return launcher(args)
+    finally:
+        module.signal = signal
+
+
 def _load_prelaunch_runtime() -> _PrelaunchRuntime:
     """Import the modules that are safe before the Isaac Sim app launches."""
     try:
@@ -351,6 +393,7 @@ class RoboDojoEnvironment(BaseEnvironment):
 
         root_value = robodojo_root or os.environ.get(
             'ROBODOJO_ROOT') or ROBODOJO_DEFAULT_ROOT
+        self._isaac_runtime_dir = None
         self.robodojo_root = str(Path(root_value).expanduser().resolve())
         self.env_cfg_type = env_cfg_type
         self.action_mode = action_mode
@@ -406,18 +449,28 @@ class RoboDojoEnvironment(BaseEnvironment):
     def setup(self) -> None:
         if self._env is not None:
             raise RuntimeError('RoboDojoEnvironment.setup() was called twice')
+        self.validate_layouts()
         self._prepare_runtime_paths()
         self._configure_run_identity()
         runtime = _load_prelaunch_runtime()
         physx_monitor = runtime.get_physx_monitor()
-        physx_monitor.start(enabled=True)
+        log_directory = tempfile.mkdtemp(prefix='fluxthemis-isaac-')
+        self._isaac_runtime_dir = Path(log_directory)
+        capture = FileLogCapture(physx_monitor, log_directory)
+        capture.install()
+        print(
+            f'[FluxThemis] PhysX file capture pid={os.getpid()} '
+            f'logs={log_directory}',
+            flush=True)
         self._physx_monitor = physx_monitor
-        app_launcher = runtime.AppLauncher(
-            self._build_app_args(runtime.AppLauncher))
-        simulation_app = app_launcher.app
-        self._runtime = runtime
-        self._simulation_app = simulation_app
+        simulation_app = None
         try:
+            physx_monitor.start(enabled=True)
+            app_launcher = _launch_worker_app(
+                runtime.AppLauncher, self._build_app_args(runtime.AppLauncher))
+            simulation_app = app_launcher.app
+            self._runtime = runtime
+            self._simulation_app = simulation_app
             # Isaac Sim / Kit may prepend its own entries to sys.path after
             # launch. Restore the RoboDojo root to sys.path[0] before any
             # post-launch RoboDojo module import, otherwise XPolicyLab's
@@ -433,9 +486,16 @@ class RoboDojoEnvironment(BaseEnvironment):
                 'WsModelClient'] = _NoOpModelClient
             self._post = post
             self._activate_task(self._tasks[0])
-        except Exception:
+        except BaseException:
+            if self.worker_id is not None:
+                # Disposable workers report the original exception through
+                # their saved stderr and hard-exit. Kit.close() may instead
+                # exit with code 0 or hang, hiding this initialization error
+                # from both the log and the process supervisor.
+                raise
             try:
-                simulation_app.close()
+                if simulation_app is not None:
+                    simulation_app.close()
             except Exception:
                 pass
             self._runtime = None
@@ -445,6 +505,47 @@ class RoboDojoEnvironment(BaseEnvironment):
             physx_monitor.shutdown()
             self._physx_monitor = None
             raise
+
+    def validate_layouts(
+        self,
+        episodes_per_task: int = 1,
+        episodes_per_task_overrides: Mapping[str, int] | None = None
+    ) -> dict[str, int]:
+        """Check task layout coverage on CPU before launching Isaac Sim.
+
+        Match SeedManager's numeric file suffixes and config_name directory.
+        Counts are a minimum; unstable layouts may require additional cases.
+        This does not validate referenced USD assets or simulator execution.
+        """
+        root = Path(self.robodojo_root)
+        config_path = root / 'env_cfg' / f'{self.env_cfg_type}.yml'
+        config_name = _read_env_cfg_config(config_path).get('config_name')
+        if not config_name:
+            raise ValueError(f'RoboDojo config_name missing in {config_path}')
+        layout_dir = (
+            root / 'Assets' / 'Eval_Layout' / ROBODOJO_BENCHMARK /
+            str(config_name) / str(self.seed))
+        if not layout_dir.is_dir():
+            raise FileNotFoundError(f'RoboDojo layout directory missing: '
+                                    f'{layout_dir}')
+        files = [path.name for path in layout_dir.iterdir() if path.is_file()]
+        overrides = episodes_per_task_overrides or {}
+        counts = {}
+        insufficient = []
+        for task in self._tasks:
+            pattern = re.compile(rf'{re.escape(task.task_id)}_\d+\.json')
+            count = sum(bool(pattern.fullmatch(name)) for name in files)
+            counts[task.task_id] = count
+            required = overrides.get(task.task_id, episodes_per_task)
+            if count < required:
+                insufficient.append(f'{task.task_id}: {count}/{required}')
+        if insufficient:
+            raise FileNotFoundError(
+                f'RoboDojo layouts missing or insufficient in {layout_dir} '
+                f'(available/required): {", ".join(insufficient)}. '
+                'Download layouts and their referenced assets for the '
+                'selected tasks; a smoke asset subset cannot run task=all.')
+        return counts
 
     def _create_env_for_active_task(self) -> None:
         if self._runtime is None or self._post is None:
@@ -808,6 +909,21 @@ class RoboDojoEnvironment(BaseEnvironment):
         args.num_envs = self.num_envs
         args.device = f'cuda:{self._device_id}'
         args.seed = self.seed
+        # XDG_CACHE_HOME alone does not move Kit's portable directories out
+        # of a shared Conda install. Each disposable worker gets its own
+        # data/cache/logs root, including after a supervisor restart.
+        if self._isaac_runtime_dir is not None:
+            kit_root = self._isaac_runtime_dir / 'kit'
+            kit_root.mkdir(parents=True, exist_ok=True)
+            # The registry ignores --portable-root for its global download
+            # cache and links extensions back to it. Concurrent cold starts
+            # can unpack over libraries already mapped by another worker.
+            registry_cache = kit_root / 'registry'
+            registry_cache.mkdir(parents=True, exist_ok=True)
+            args.kit_args = (getattr(args, 'kit_args', '') +
+                             f' --portable --portable-root {kit_root}'
+                             ' --/exts/omni.kit.registry.nucleus/cachePath='
+                             f'{registry_cache}').strip()
         return args
 
     def _build_env_cfg(self, runtime: _PrelaunchRuntime,

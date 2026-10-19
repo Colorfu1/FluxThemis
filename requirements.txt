@@ -4,3 +4,4 @@ msgpack>=1.0
 mmengine==0.10.7
 numpy>=1.26.0,<2
 pyzmq>=25,<27
+PyYAML>=6,<7

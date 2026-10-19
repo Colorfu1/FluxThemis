@@ -167,6 +167,8 @@ class FluxVLAPolicyClient(BasePolicyClient):
             deployment_id=self.transport.server_deployment_id,
             request_id=request_id,
             policy_seed=self._policy_seed,
+            episode_id=self._episode_id,
+            sequence=self._prediction_sequence,
             deadline_ms=int(self.transport.request_timeout_s * 1000),
             unnorm_key=unnorm_key,
         )

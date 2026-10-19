@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from fluxthemis.engines.utils import to_jsonable
@@ -119,6 +119,7 @@ class DistributedEvaluationCoordinator:
         self._worker_router = None
         self._context = None
         self._stopping = False
+        self._strict_worker_assignment = False
 
     def run(self, evaluation_run: EvaluationRun) -> dict[str, Any]:
         import zmq
@@ -184,6 +185,7 @@ class DistributedEvaluationCoordinator:
                                                                     ...],
                   evaluation_run: EvaluationRun) -> dict[str, Any]:
         settings = evaluation_run.settings
+        self._strict_worker_assignment = settings.strict_worker_assignment
         selected_tasks = select_tasks(canonical_task_manifest,
                                       settings.task_ids)
         jobs = build_episode_jobs(
@@ -197,7 +199,12 @@ class DistributedEvaluationCoordinator:
         self._scheduling_state = scheduling_state
 
         try:
-            evaluation_run.start(selected_tasks, len(jobs))
+            evaluation_run.start(selected_tasks, len(jobs),
+                                 self.expected_workers)
+            # Rebuild the new report session before dispatching, so saved
+            # results are counted without rerunning completed episodes.
+            self._restore_jobs(evaluation_run)
+            self._replay_results(evaluation_run)
             self._dispatch_jobs()
             while not scheduling_state.is_complete:
                 if self._stopping:
@@ -244,6 +251,62 @@ class DistributedEvaluationCoordinator:
             )
             raise
 
+    def _restore_jobs(self, evaluation_run: EvaluationRun) -> None:
+        data = evaluation_run.resume_data
+        if not data:
+            return
+        state = self._require_scheduling_state()
+        saved = {j['global_episode_number']: j for j in data['jobs']}
+        # Keep the new session's job IDs and canonical seeds. Only layout
+        # choices come from recovery, including replacements of rejected cases.
+        for key, job in list(state.jobs_by_episode_id.items()):
+            state.jobs_by_episode_id[key] = replace(
+                job,
+                environment_case_index=saved[job.global_episode_number]
+                ['environment_case_index'])
+        state.pending_jobs = deque(state.jobs_by_episode_id.values())
+        state.next_environment_case_index_by_task = dict(
+            data['next_environment_case_index_by_task'])
+
+    def _replay_results(self, evaluation_run: EvaluationRun) -> None:
+        data = evaluation_run.resume_data
+        if not data:
+            return
+        result_fields = {f.name for f in fields(EpisodeResult)}
+        state = self._require_scheduling_state()
+        # Session IDs change on resume; task ID and episode index do not.
+        by_key = {
+            (j.task.task_id, j.episode_index): j
+            for j in state.jobs_by_episode_id.values()
+        }
+        for pair in data['completed']:
+            end = pair['end']
+            job = by_key[(end['task_id'], end['episode_index'])]
+            result = EpisodeResult(**{
+                k: v
+                for k, v in end.items() if k in result_fields
+            })
+            job.validate_result(result)
+            payload = job.episode_start_payload(pair['start']['started_at'])
+            payload['resumed_from'] = data['source']
+            # Replay report events with the original timestamps and results;
+            # no simulator reset or policy inference is needed for these jobs.
+            evaluation_run.on_episode_start(payload)
+            evaluation_run.on_episode_end(
+                result,
+                job.episode_id,
+                finished_at=end['finished_at'],
+                resumed_from=data['source'])
+            state.results_by_episode_id[job.episode_id] = result
+        state.pending_jobs = deque(
+            j for j in state.pending_jobs
+            if j.episode_id not in state.results_by_episode_id)
+        print(
+            f'[FluxThemis] restored {len(state.results_by_episode_id)}'
+            f'/{len(state.jobs)} '
+            f'episodes; remaining={len(state.pending_jobs)}',
+            flush=True)
+
     def _poll_once(self, poller: Any, timeout_s: float,
                    evaluation_run: EvaluationRun) -> None:
         events = dict(poller.poll(timeout=max(1, int(timeout_s * 1000))))
@@ -283,8 +346,10 @@ class DistributedEvaluationCoordinator:
             if job.episode_id in scheduling_state.results_by_episode_id:
                 raise RuntimeError(
                     f'duplicate episode result {job.episode_id!r}')
-            scheduling_state.results_by_episode_id[job.episode_id] = result
+            # Report acknowledgement must precede completion and slot reuse;
+            # a failed report must not leave an apparently finished job.
             evaluation_run.on_episode_end(result, job.episode_id)
+            scheduling_state.results_by_episode_id[job.episode_id] = result
             self._release_worker_slot(slot)
         elif message_type == 'environment_case_rejected':
             job = self._require_assigned_job(slot, header)
@@ -414,19 +479,35 @@ class DistributedEvaluationCoordinator:
 
     def _dispatch_jobs(self) -> None:
         scheduling_state = self._require_scheduling_state()
+        if self._strict_worker_assignment:
+            # Use the stable task-major ordinal, not completion order, so
+            # retries stay on the same worker for a given worker count. Scan
+            # past busy workers to let other fixed assignments proceed.
+            for job in tuple(scheduling_state.pending_jobs):
+                index = (job.global_episode_number - 1) % self.expected_workers
+                slot = self._worker_slots.get(f'simulator-worker-{index}')
+                if slot is None or not slot.is_idle:
+                    continue
+                scheduling_state.pending_jobs.remove(job)
+                self._idle_worker_ids.remove(slot.worker_id)
+                self._assign_job(slot, job)
+            return
+        # Default scheduling still gives the next job to any idle worker.
         while scheduling_state.pending_jobs:
             slot = self._next_idle_worker_slot()
             if slot is None:
                 return
             job = scheduling_state.pending_jobs.popleft()
-            slot.current_job = job
-            slot.episode_deadline = self._new_episode_deadline()
-            self._send_worker_message(
-                'episode_job',
-                slot,
-                episode_id=job.episode_id,
-                payload=encode_frame(to_jsonable(job)),
-            )
+            self._assign_job(slot, job)
+
+    def _assign_job(self, slot: _WorkerSlot, job: EpisodeJob) -> None:
+        slot.current_job = job
+        slot.episode_deadline = self._new_episode_deadline()
+        self._send_worker_message(
+            'episode_job',
+            slot,
+            episode_id=job.episode_id,
+            payload=encode_frame(to_jsonable(job)))
 
     def _next_idle_worker_slot(self) -> _WorkerSlot | None:
         while self._idle_worker_ids:

@@ -132,28 +132,17 @@ class FluxVLAZMQTransport:
                 raise TimeoutError(
                     f'FluxVLA server at {self.endpoint} did not become ready '
                     f'within {self.connect_timeout_s:g}s')
-            request_id = uuid.uuid4().hex
             try:
-                response_header, response_payload = self.request(
-                    encode_header('status', request_id=request_id),
-                    encode_frame({}), _SERVER_PROBE_TIMEOUT_S)
-                self.validate_response(response_header, request_id)
-                status = decode_frame(response_payload)
-                if not isinstance(status, Mapping):
-                    raise RuntimeError('FluxVLA status response is invalid')
-                server_deployment_id = nonempty_string(
-                    status.get('deployment_id'), 'status.deployment_id')
+                status = request_status(
+                    self.request,
+                    _SERVER_PROBE_TIMEOUT_S,
+                    require_evaluation_reporting=require_evaluation_reporting)
+                server_deployment_id = status['deployment_id']
                 if (self._server_deployment_id is not None and
                         server_deployment_id != self._server_deployment_id):
                     raise RuntimeError('FluxVLA server deployment changed '
                                        'while the client was connected')
                 self._server_deployment_id = server_deployment_id
-                if status.get('server_mode') != 'stateless':
-                    raise RuntimeError('FluxVLA server is not stateless')
-                if (require_evaluation_reporting and
-                        not bool(status.get('evaluation_reporting', False))):
-                    raise RuntimeError(
-                        'FluxVLA server does not enable evaluation reporting')
                 if status.get('status') == 'ready':
                     return
             except TimeoutError:
@@ -168,6 +157,54 @@ class FluxVLAZMQTransport:
                 )
                 next_log_at = now + _SERVER_WAIT_LOG_INTERVAL_S
             time.sleep(0.2)
+
+
+def validate_status(status, workers=None, require_evaluation_reporting=True):
+    if not isinstance(status, Mapping):
+        raise ValueError('FluxVLA status response must be a mapping')
+    nonempty_string(status.get('deployment_id'), 'deployment_id')
+    if status.get('server_mode') != 'stateless':
+        raise ValueError('FluxVLA server must be stateless')
+    if require_evaluation_reporting and status.get(
+            'evaluation_reporting') is not True:
+        raise ValueError('FluxVLA evaluation reporting is disabled')
+    ready, expected = status.get('workers_ready'), status.get(
+        'workers_expected')
+    if (type(ready) is not int or type(expected) is not int or expected < 1
+            or not 0 <= ready <= expected
+            or (workers is not None and expected != workers)):
+        raise ValueError('FluxVLA worker counts do not match')
+    state = status.get('status')
+    if state not in ('starting', 'ready') or (state == 'ready'
+                                              and ready != expected):
+        raise ValueError(f'Invalid FluxVLA readiness: {state}')
+    return status
+
+
+def request_status(request, timeout_s, **checks):
+    """Common status request and validation for readiness and telemetry."""
+    request_id = uuid.uuid4().hex
+    header, payload = request(
+        encode_header('status', request_id=request_id), encode_frame({}),
+        timeout_s)
+    FluxVLAZMQTransport.validate_response(header, request_id)
+    if header.get('type') != 'status_response':
+        raise ValueError('Invalid FluxVLA status response type')
+    return validate_status(decode_frame(payload), **checks)
+
+
+def query_status(endpoint, timeout_s=2, **checks):
+    """One bounded probe, without waiting for a ready model."""
+    import zmq
+    transport = FluxVLAZMQTransport(dict(endpoint=endpoint))
+    try:
+        transport._context = zmq.Context()
+        transport._socket = transport._connect_socket(zmq)
+        transport._socket.setsockopt(zmq.SNDTIMEO, max(1,
+                                                       int(timeout_s * 1000)))
+        return request_status(transport.request, timeout_s, **checks)
+    finally:
+        transport.close()
 
 
 def connection_transport(values: Mapping[str, Any]) -> dict[str, Any]:

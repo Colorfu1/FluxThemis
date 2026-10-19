@@ -1,0 +1,26 @@
+# Run on the simulator host: python scripts/run_evaluation.py --config THIS_FILE --smoke
+# Use --full for all tasks; both flags preserve GPU/worker and connection settings.
+# Paths are relative to this YAML file; ~ and ${ENV_VAR} are supported.
+version: 1
+simulator:
+  robodojo_root: ../../../RoboDojo
+  assets: null  # Defaults to robodojo_root/Assets.
+  config: arx_x5.py
+  gpu_ids: [0]
+  workers_per_gpu: 1
+  task: put_bottles_into_dustbin  # Used when neither --smoke nor --full is given.
+  episodes: 1  # --smoke uses one episode per configured simulator worker.
+  cache: ~/.cache/fluxthemis-robodojo
+  save_videos: true
+  coordinator_port: 15558  # Next port is reserved for simulator torchrun.
+model:
+  host: 127.0.0.1  # Cloud split: set the model server's reachable private IP.
+  port: 15555     # Model/tunnel port, NOT the public SSH port.
+  wait_seconds: 1800
+  result_dir: null  # Optional model_identity.json for resume; GPU metrics are separate.
+  expected_workers: null  # Optional readiness check; does not launch model workers.
+run:
+  output_root: ../../work_dirs/robodojo
+  max_minutes: 0  # No fixed time limit.
+resume:
+  from_dir: null  # Stopped run; task/episodes must match. Current paths and output_root are used.

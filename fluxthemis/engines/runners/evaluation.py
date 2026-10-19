@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from numbers import Integral
@@ -14,6 +14,8 @@ from fluxthemis.engines.utils import to_jsonable
 from fluxthemis.evaluators.base import BaseEvaluator
 from fluxthemis.reporters.base import BaseEvaluationReporter
 from fluxthemis.structures import EpisodeResult, TaskSpec
+
+from .resume import manifest, read_bundle
 
 
 class EvaluationStatus(str, Enum):
@@ -34,9 +36,13 @@ class EvaluationSettings:
     execute_horizon: int | None = None
     task_ids: Sequence[str] | str | None = None
     stop_on_success: bool = True
+    # Fixed assignment is opt-in; existing configs retain dynamic scheduling.
+    strict_worker_assignment: bool = False
     run_name: str | None = None
     episodes_per_task_overrides: Mapping[str,
                                          int] = field(default_factory=dict)
+    # A recovery bundle contains episode results, not live simulator state.
+    resume_path: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.base_seed,
@@ -57,12 +63,19 @@ class EvaluationSettings:
                            _normalize_task_ids(self.task_ids))
         if not isinstance(self.stop_on_success, bool):
             raise TypeError('stop_on_success must be a boolean')
+        if not isinstance(self.strict_worker_assignment, bool):
+            raise TypeError('strict_worker_assignment must be a boolean')
         run_name = self.run_name or _default_run_name()
         _validate_run_name(run_name)
         object.__setattr__(self, 'run_name', run_name)
         object.__setattr__(
             self, 'episodes_per_task_overrides',
             _normalize_episode_overrides(self.episodes_per_task_overrides))
+        for name in ('resume_path', ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name,
+                                   str(Path(value).expanduser().resolve()))
 
 
 def utc_now() -> str:
@@ -143,6 +156,11 @@ class EvaluationRun:
         self.evaluator = evaluator
         self.reporter = reporter
         self._started_monotonic: float | None = None
+        self.resume_data = None
+        if settings.resume_path:
+            self.resume_data = read_bundle(settings.resume_path)
+            _validate_resume_settings(settings, self.resume_data['start'])
+        self.start_payload = None
 
     @property
     def run_session_id(self) -> str:
@@ -168,37 +186,65 @@ class EvaluationRun:
             except Exception:
                 pass
 
-    def start(self, selected_tasks: Sequence[TaskSpec],
-              total_episodes: int) -> None:
+    def start(self,
+              selected_tasks: Sequence[TaskSpec],
+              total_episodes: int,
+              worker_count: int = 1) -> None:
         if self._state.status is not EvaluationStatus.CREATED:
             raise RuntimeError(f'cannot start evaluation while status is '
                                f'{self._state.status.value!r}')
         self._state.selected_tasks = tuple(selected_tasks)
         self._state.total_episodes = total_episodes
         self._state.started_at = utc_now()
+        payload = _build_run_start_event(self.settings, self._state)
+        # The model server needs both fields to check fixed-worker pairing.
+        payload['parallel_workers'] = worker_count
+        payload['strict_worker_assignment'] = (
+            self.settings.strict_worker_assignment)
+        if self.resume_data:
+            # Config checks alone cannot detect a changed task inventory;
+            # compare the tasks actually discovered by the simulator as well.
+            if manifest(payload) != manifest(self.resume_data['start']):
+                raise ValueError('Resume task manifest/settings differ '
+                                 'from the original run')
+            payload['resumed_from'] = self.resume_data['source']
+            payload['restored_episodes'] = len(self.resume_data['completed'])
+        self.start_payload = payload
         self._state.status = EvaluationStatus.RUNNING
-        self._started_monotonic = time.perf_counter()
         self.evaluator.on_run_start(self._state.selected_tasks)
-        self.reporter.report_evaluation(
-            'run_start', _build_run_start_event(self.settings, self._state))
+        self.reporter.report_evaluation('run_start', payload)
 
     def on_episode_start(self, payload: Mapping[str, Any]) -> None:
         self._require_running()
         self.reporter.report_evaluation('episode_start', payload)
+        # Replayed events rebuild reports only. Start the execution clock at
+        # the first new episode so replay time is not counted as evaluation.
+        if not payload.get('resumed_from') and self._started_monotonic is None:
+            self._started_monotonic = time.perf_counter()
 
-    def on_episode_end(self, result: EpisodeResult, episode_id: str) -> None:
+    def on_episode_end(self,
+                       result: EpisodeResult,
+                       episode_id: str,
+                       *,
+                       finished_at: str | None = None,
+                       resumed_from: str | None = None) -> None:
         self._require_running()
-        self.evaluator.on_episode_end(result)
-        self._state.completed_episodes += 1
-        self.reporter.report_evaluation(
-            'episode_end',
-            _build_episode_end_event(
-                result,
+        # Send the expected next count without committing it locally until
+        # the reporter returns successfully from the acknowledged write.
+        payload = _build_episode_end_event(
+            result,
+            replace(
                 self._state,
-                episode_id,
-                finished_at=utc_now(),
-            ),
-        )
+                completed_episodes=self._state.completed_episodes + 1),
+            episode_id,
+            finished_at=finished_at or utc_now())
+        if resumed_from:
+            payload['resumed_from'] = resumed_from
+        self.reporter.report_evaluation('episode_end', payload)
+        # Completion accounting must match the acknowledged journal even if
+        # transport fails and we later manage to report a failed run_end.
+        self._state.completed_episodes += 1
+        self.evaluator.on_episode_end(result)
 
     def finish(self, last_result: EpisodeResult | None) -> dict[str, Any]:
         self._require_running()
@@ -255,10 +301,15 @@ class EvaluationRun:
     def _stop(self, status: EvaluationStatus) -> None:
         self._state.status = status
         self._state.finished_at = utc_now()
+        self._state.duration_s = 0.0
         if self._started_monotonic is not None:
             self._state.duration_s = max(
                 0.0,
                 time.perf_counter() - self._started_monotonic)
+        if self.resume_data:
+            # Previous attempts contribute only their recorded execution
+            # windows; downtime between attempts is excluded.
+            self._state.duration_s += self.resume_data['elapsed_execution_s']
 
     def _summarize_safely(
             self) -> tuple[dict[str, Any], dict[str, str]
@@ -275,6 +326,27 @@ class EvaluationRun:
         if self._state.status is not EvaluationStatus.RUNNING:
             raise RuntimeError(
                 f'evaluation is not running: {self._state.status.value!r}')
+
+
+def _validate_resume_settings(settings: EvaluationSettings,
+                              start: Mapping[str, Any]) -> None:
+    # CPU dry-run can check settings before connecting a reporter or simulator.
+    # The real environment task inventory is checked again in start().
+    fields = ('base_seed', 'episodes_per_task', 'max_episode_steps',
+              'execute_horizon', 'stop_on_success', 'strict_worker_assignment')
+    changed = any(getattr(settings, key) != start.get(key) for key in fields)
+    counts = {
+        task:
+        settings.episodes_per_task_overrides.get(task,
+                                                 settings.episodes_per_task)
+        for task in start['task_ids']
+    }
+    changed = changed or counts != start['episodes_per_task_by_task']
+    if settings.task_ids is not None:
+        changed = changed or list(settings.task_ids) != start['task_ids']
+    if changed:
+        raise ValueError(
+            'Resume task manifest/settings differ from the original run')
 
 
 def _build_summary(settings: EvaluationSettings, state: _EvaluationState,
