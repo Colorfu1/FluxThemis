@@ -1,5 +1,3 @@
-# Run on the simulator host: python scripts/run_evaluation.py --config THIS_FILE --smoke
-# Use --full for all tasks; both flags preserve GPU/worker and connection settings.
 # Paths are relative to this YAML file; ~ and ${ENV_VAR} are supported.
 version: 1
 simulator:
