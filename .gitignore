@@ -27,3 +27,10 @@ build/
 *.mp4
 *.avi
 *.mov
+
+# Local evaluation inputs and outputs. Match directories and storage symlinks.
+/checkpoints
+/datasets
+/work_dirs
+/libero_results
+/.cache

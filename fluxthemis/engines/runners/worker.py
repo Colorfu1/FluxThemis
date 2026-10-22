@@ -57,6 +57,9 @@ class SimulatorWorkerSupervisor:
         generation = 0
         while True:
             ready_event = self._context.Event()
+            # Each child needs its own flag; a previous generation's shutdown
+            # acknowledgement must not classify a later exit as intentional.
+            stop_received = self._context.Event()
             process = self._context.Process(
                 target=_run_simulator_worker,
                 kwargs={
@@ -70,6 +73,7 @@ class SimulatorWorkerSupervisor:
                     'config_overrides': self.config_overrides,
                     'parent_pid': os.getpid(),
                     'ready_event': ready_event,
+                    'stop_received': stop_received,
                 },
                 name=self.worker_id,
             )
@@ -95,7 +99,10 @@ class SimulatorWorkerSupervisor:
             except BaseException:
                 _terminate_process(process)
                 raise
-            if process.exitcode == 0 and not startup_timed_out:
+            # Kit can terminate Python with code 0 before the job is done.
+            # Only a coordinator shutdown makes that a normal pool exit.
+            if (process.exitcode == 0 and not startup_timed_out
+                    and stop_received.is_set()):
                 return
             restart_reason = ('startup timeout' if startup_timed_out else
                               f'exit code {process.exitcode}')
@@ -113,8 +120,8 @@ class _SimulatorWorker:
     def __init__(self, *, config_path: str, rollout_endpoint: str,
                  worker_id: str, deployment_id: str, generation: int,
                  device: str, episode_timeout_s: float,
-                 config_overrides: Mapping[str,
-                                           Any], ready_event: Any) -> None:
+                 config_overrides: Mapping[str, Any], ready_event: Any,
+                 stop_received: Any) -> None:
         self.config_path = config_path
         self.rollout_endpoint = rollout_endpoint
         self.worker_id = worker_id
@@ -124,6 +131,7 @@ class _SimulatorWorker:
         self.episode_timeout_s = episode_timeout_s
         self.config_overrides = config_overrides
         self.ready_event = ready_event
+        self.stop_received = stop_received
 
     @property
     def _message_identity(self) -> dict[str, Any]:
@@ -146,6 +154,9 @@ class _SimulatorWorker:
         socket.connect(self.rollout_endpoint)
         environment: BaseEnvironment | None = None
         policy_client: BasePolicyClient | None = None
+        # Save stderr before simulator redirection, so Python failures reach
+        # the supervisor's log before os._exit bypasses normal cleanup.
+        error_fd = os.dup(2)
         try:
             self._register(socket)
             evaluation_cfg = load_distributed_evaluation_config(
@@ -171,6 +182,9 @@ class _SimulatorWorker:
             while True:
                 job = self._receive_job(socket)
                 if job is None:
+                    # Kit cleanup can terminate Python before run() returns.
+                    # A zero exit is normal only after this protocol message.
+                    self.stop_received.set()
                     return
                 self._execute_job(
                     socket=socket,
@@ -183,8 +197,17 @@ class _SimulatorWorker:
                     video_fps=video_fps,
                 )
         except BaseException:
-            traceback.print_exc()
-            os._exit(1)
+            try:
+                # Closing the stream flushes the traceback before os._exit;
+                # normal interpreter cleanup may hang in native simulator code.
+                with os.fdopen(error_fd, 'w', closefd=False) as error_log:
+                    print(
+                        f'[FluxThemis] simulator worker failed '
+                        f'id={self.worker_id} generation={self.generation}',
+                        file=error_log)
+                    traceback.print_exc(file=error_log)
+            finally:
+                os._exit(1)
         finally:
             for component in (environment, policy_client):
                 if component is None:
@@ -195,6 +218,7 @@ class _SimulatorWorker:
                     pass
             socket.close(linger=0)
             context.term()
+            os.close(error_fd)
 
     def _register(self, socket: Any) -> None:
         socket.send_multipart([
@@ -281,8 +305,12 @@ def _run_simulator_worker(*, config_path: str, rollout_endpoint: str,
                           worker_id: str, deployment_id: str, generation: int,
                           device: str, episode_timeout_s: float,
                           config_overrides: Mapping[str, Any], parent_pid: int,
-                          ready_event: Any) -> None:
+                          ready_event: Any, stop_received: Any) -> None:
     configure_worker_lifetime(parent_pid)
+    print(
+        f'[FluxThemis] simulator process id={worker_id} '
+        f'pid={os.getpid()} generation={generation}',
+        flush=True)
     _SimulatorWorker(
         config_path=config_path,
         rollout_endpoint=rollout_endpoint,
@@ -293,6 +321,7 @@ def _run_simulator_worker(*, config_path: str, rollout_endpoint: str,
         episode_timeout_s=episode_timeout_s,
         config_overrides=config_overrides,
         ready_event=ready_event,
+        stop_received=stop_received,
     ).run()
 
 

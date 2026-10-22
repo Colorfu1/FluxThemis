@@ -13,7 +13,7 @@ from mmengine import DictAction
 
 from fluxthemis.transports.fluxvla_zmq import DEFAULT_ENDPOINT
 
-_LOCAL_GPU_COUNT_ENV_VARS = ('NPROC_PER_NODE', 'MLP_WORKER_GPU')
+_LOCAL_GPU_COUNT_ENV_VARS = ('LOCAL_WORLD_SIZE', 'NPROC_PER_NODE')
 DEFAULT_ROLLOUT_BIND = 'tcp://0.0.0.0:15558'
 DEFAULT_STARTUP_TIMEOUT_S = 900.0
 DEFAULT_EPISODE_TIMEOUT_S = 3600.0
@@ -38,6 +38,15 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description='Launch distributed FluxThemis evaluation over ZMQ.')
     parser.add_argument('--config', required=True)
+    parser.add_argument('--workers-per-gpu', type=int, default=1)
+    parser.add_argument(
+        '--scheduling',
+        choices=['dynamic', 'fixed'],
+        help='Override config scheduling (default: dynamic).')
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Validate configuration without models or simulators.')
     parser.add_argument(
         '--server-endpoint',
         default=None,
@@ -47,6 +56,8 @@ def parse_args(argv=None):
         default=None,
         help='Override auto-detected local simulator GPUs, for example 0,1.')
     parser.add_argument('--run-name', default=None)
+    parser.add_argument(
+        '--resume-from', help='Validated episode recovery bundle JSON.')
     parser.add_argument('--video-dir', default=None)
     parser.add_argument('--save-videos', action='store_true')
     networking = parser.add_argument_group('advanced networking')
@@ -92,11 +103,22 @@ def _connect_endpoint(bind: str, host: str) -> str:
     return f'tcp://{host}:{parsed.port}'
 
 
-def _discover_devices(
-        environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+def _discover_devices(environ: Mapping[str, str] | None = None,
+                      workers_per_gpu: int = 1) -> tuple[str, ...]:
     """Return local CUDA visibility tokens for simulator workers."""
     environ = os.environ if environ is None else environ
     worker_count = _local_gpu_count(environ)
+    if workers_per_gpu < 1:
+        raise ValueError('workers-per-gpu must be positive')
+    if worker_count is not None:
+        if worker_count % workers_per_gpu:
+            raise ValueError(
+                'Local workers must be divisible by workers-per-gpu')
+        worker_count //= workers_per_gpu
+    elif environ.get('MLP_WORKER_GPU'):
+        worker_count = int(environ['MLP_WORKER_GPU'])
+        if worker_count < 1:
+            raise ValueError('MLP_WORKER_GPU must be positive')
     visible = environ.get('CUDA_VISIBLE_DEVICES')
     devices = None
     if visible is not None:
@@ -153,21 +175,45 @@ def main(argv=None) -> int:
     rank, world_size, local_rank, master_addr = _torchrun_environment()
     config_path = str(Path(args.config).expanduser().resolve(strict=True))
     overrides = dict(args.cfg_options or {})
+    if args.scheduling is not None:
+        overrides['themis.evaluation.strict_worker_assignment'] = (
+            args.scheduling == 'fixed')
     if args.server_endpoint is not None:
         overrides['themis.transport.endpoint'] = args.server_endpoint
     if args.run_name is not None:
         overrides['themis.evaluation.run_name'] = args.run_name
+    if args.resume_from:
+        overrides['themis.evaluation.resume_path'] = args.resume_from
     if args.video_dir is not None:
         overrides['themis.evaluation.video_dir'] = args.video_dir
     if args.save_videos:
         overrides['themis.evaluation.save_videos'] = True
+    if args.workers_per_gpu < 1:
+        raise ValueError('workers-per-gpu must be positive')
+    if args.dry_run:
+        import importlib
+
+        for dependency in ('zmq', 'msgpack'):
+            importlib.import_module(dependency)
+        from fluxthemis.engines.runners.config import (
+            build_distributed_evaluation_run, distributed_video_settings,
+            load_distributed_evaluation_config)
+        build_distributed_evaluation_run(config_path, overrides)
+        distributed_video_settings(
+            load_distributed_evaluation_config(config_path, overrides))
+        print('Distributed evaluation configuration validated.', flush=True)
+        return 0
     devices = (
-        _parse_devices(args.simulator_gpus)
-        if args.simulator_gpus is not None else _discover_devices())
-    if local_rank >= len(devices):
+        _parse_devices(args.simulator_gpus) if args.simulator_gpus is not None
+        else _discover_devices(workers_per_gpu=args.workers_per_gpu))
+    local_workers = int(os.environ.get('LOCAL_WORLD_SIZE', '1'))
+    if local_workers != len(devices) * args.workers_per_gpu:
+        raise ValueError(
+            'Local simulator worker count must equal GPUs * workers-per-gpu')
+    if local_rank >= local_workers:
         raise ValueError(
             f'LOCAL_RANK={local_rank} has no simulator GPU in {devices}')
-    device = devices[local_rank]
+    device = devices[local_rank % len(devices)]
     print(
         f'[FluxThemis] rank={rank} starting simulator worker on GPU {device}',
         flush=True)

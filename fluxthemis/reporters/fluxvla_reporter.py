@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import os
 import uuid
 from collections.abc import Mapping
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from fluxthemis.engines.utils import EVALUATION_REPORTERS
@@ -20,17 +24,29 @@ REPORT_EVENT_TYPES = ('run_start', 'episode_start', 'episode_end', 'run_end')
 class FluxVLAEvaluationReporter(BaseEvaluationReporter):
     """Publish lifecycle events to FluxVLA's authoritative report service."""
 
-    def __init__(self, transport: Mapping[str, Any]) -> None:
+    def __init__(self,
+                 transport: Mapping[str, Any],
+                 event_log: str | None = None) -> None:
         self.transport = FluxVLAZMQTransport(transport)
         self._run_session_id: str | None = None
         self._sequence = 1
         self._run_dir: str | None = None
+        self._event_log = Path(event_log) if event_log else None
+        self._event_stream = None
 
     def setup(self) -> None:
         self.transport.setup(require_evaluation_reporting=True)
         self._run_session_id = uuid.uuid4().hex
         self._sequence = 1
         self._run_dir = None
+        if self._event_log is not None:
+            try:
+                self._event_log.parent.mkdir(parents=True, exist_ok=True)
+                self._event_stream = self._event_log.open(
+                    'x', encoding='utf-8')
+            except OSError:
+                self.close()
+                raise
 
     @property
     def run_session_id(self) -> str:
@@ -71,10 +87,26 @@ class FluxVLAEvaluationReporter(BaseEvaluationReporter):
                 f'run_dir from {self._run_dir!r} to {run_dir!r}')
         self._run_dir = run_dir
         self._sequence += 1
+        # Only mirror events acknowledged by the authoritative remote writer.
+        if self._event_stream is not None:
+            self._event_stream.write(
+                json.dumps(
+                    dict(
+                        recorded_at=datetime.now(timezone.utc).isoformat(),
+                        event_type=event_type,
+                        run_session_id=self.run_session_id,
+                        sequence=self._sequence - 1,
+                        run_dir=run_dir,
+                        payload=dict(payload))) + '\n')
+            self._event_stream.flush()
+            os.fsync(self._event_stream.fileno())
         return run_dir
 
     def close(self) -> None:
         self.transport.close()
+        if self._event_stream is not None:
+            self._event_stream.close()
+            self._event_stream = None
         self._run_session_id = None
 
     def _validate_response(self, header: Mapping[str, Any], payload: bytes,
