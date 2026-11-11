@@ -11,15 +11,16 @@ from fluxthemis.engines.runners.episode import (build_episode_jobs,
                                                 execute_assignment)
 from fluxthemis.engines.runners.evaluation import (EvaluationRun,
                                                    EvaluationSettings)
-from fluxthemis.engines.runners.resume import canonical_jobs
 from fluxthemis.engines.runners.worker import _SimulatorWorker
+from fluxthemis.engines.utils import to_jsonable
 from fluxthemis.environments import MockEnvironment, MockVectorEnvironment
 from fluxthemis.evaluators import SuccessRateEvaluator
 from fluxthemis.model_clients import MockPolicyClient
 from fluxthemis.reporters import MockEvaluationReporter
 from fluxthemis.structures import StepResult, TaskSpec
 from fluxthemis.transports.zmq_protocol import (decode_frame, decode_header,
-                                                empty_payload, encode_header)
+                                                empty_payload, encode_frame,
+                                                encode_header)
 
 
 def _jobs(count, tasks=('task', )):
@@ -151,25 +152,16 @@ def test_batch_size_validation(value):
 
 def test_batch_limits_and_scalar_recovery_compatibility():
     policy = ExecutionPolicy(2)
-    for options in ({
-            'resume': True
-    }, {
-            'save_videos': True
-    }, {
-            'strict_worker_assignment': True
-    }):
+    policy.validate_assignment(EpisodeAssignment(_jobs(1)))
+    for options in ({'save_videos': True}, {'strict_worker_assignment': True}):
         with pytest.raises(ValueError):
             policy.validate_options(**options)
         ExecutionPolicy().validate_options(**options)
-    with pytest.raises(ValueError, match='divisible'):
-        policy.validate_jobs(_jobs(3))
     mixed = EpisodeAssignment(_jobs(1, ('a', 'b')))
     with pytest.raises(ValueError, match='one task'):
         policy.validate_assignment(mixed)
     with pytest.raises(ValueError, match='duplicate'):
         EpisodeAssignment((_jobs(1)[0], ) * 2)
-    with pytest.raises(ValueError, match='resume'):
-        canonical_jobs({'episode_batch_size': 2})
 
 
 class _Socket:
@@ -204,14 +196,15 @@ def _coordinator(capacity, jobs):
     return coordinator, slot
 
 
-@pytest.mark.parametrize('capacity', [1, 2])
+@pytest.mark.parametrize('capacity', [1, 2, 10])
 def test_worker_coordinator_roundtrip_waits_for_assignment_end(
         monkeypatch, capacity):
     # Exercise the actual wire codec, worker execution and coordinator events
     # without launching a simulator or connecting a model service.
     monkeypatch.setattr('fluxthemis.engines.runners.worker._episode_timeout',
                         lambda timeout: nullcontext())
-    jobs = _jobs(capacity * 2, ('a', 'b'))
+    count = 25 if capacity == 10 else 3
+    jobs = _jobs(count, ('a', 'b'))
     coordinator, slot = _coordinator(capacity, jobs)
     socket = _Socket()
     worker = _SimulatorWorker(
@@ -228,15 +221,18 @@ def test_worker_coordinator_roundtrip_waits_for_assignment_end(
     environment = MockVectorEnvironment(capacity, success_after=1)
     environment.setup()
     run = EvaluationRun(
-        EvaluationSettings(episode_batch_size=capacity),
+        EvaluationSettings(
+            episode_batch_size=capacity, episodes_per_task=count),
         SuccessRateEvaluator(), MockEvaluationReporter())
     with run:
         run.start([TaskSpec('a'), TaskSpec('b')], len(jobs))
-        for _ in range(4):
+        batch_sizes = []
+        while coordinator._scheduling_state.pending_jobs:
             coordinator._dispatch_jobs()
             socket.incoming = coordinator._worker_router.sent[-1][1:]
             assignment = worker._receive_assignment(socket)
-            assert len(assignment.jobs) == capacity
+            assert 0 < len(assignment.jobs) <= capacity
+            batch_sizes.append(len(assignment.jobs))
             assert len({job.task.task_id for job in assignment.jobs}) == 1
             socket.sent.clear()
             worker._execute_assignment(
@@ -262,6 +258,12 @@ def test_worker_coordinator_roundtrip_waits_for_assignment_end(
             ]
             coordinator._receive_worker_message(run)
             assert slot.is_idle
+        expected_sizes = {
+            1: [1] * 6,
+            2: [2, 1, 2, 1],
+            10: [10, 10, 5, 10, 10, 5]
+        }
+        assert batch_sizes == expected_sizes[capacity]
         assert coordinator._scheduling_state.is_complete
         results = coordinator._scheduling_state.ordered_results()
         assert [r.policy_seed
@@ -270,17 +272,19 @@ def test_worker_coordinator_roundtrip_waits_for_assignment_end(
             results[-1])['run']['completed_episodes'] == len(jobs)
 
 
-def test_batch_reconnect_retains_completed_results_and_does_not_requeue():
+def test_batch_reconnect_only_requeues_unfinished_episodes():
     jobs = _jobs(2)
     coordinator, slot = _coordinator(2, jobs)
     coordinator._dispatch_jobs()
     slot.completed_episode_ids.add(jobs[0].episode_id)
     coordinator._scheduling_state.results_by_episode_id[
         jobs[0].episode_id] = 'saved'
-    with pytest.raises(ValueError, match='worker restart'):
-        coordinator._replace_worker_connection(
-            slot, routing_id=b'new', generation=1)
-    assert not coordinator._scheduling_state.pending_jobs
+    coordinator._replace_worker_connection(
+        slot, routing_id=b'new', generation=1)
+    assert list(coordinator._scheduling_state.pending_jobs) == [jobs[1]]
+    assert coordinator._scheduling_state.restart_counts_by_episode_id == {
+        jobs[1].episode_id: 1
+    }
     assert coordinator._scheduling_state.results_by_episode_id == {
         jobs[0].episode_id: 'saved'
     }
@@ -331,7 +335,7 @@ def test_duplicate_result_and_early_assignment_end_are_rejected():
 def test_scalar_environment_does_not_silently_run_a_batch():
     environment = MockEnvironment()
     environment.setup()
-    with pytest.raises(ValueError, match='fill all worker slots'):
+    with pytest.raises(ValueError, match='exceeds worker capacity'):
         execute_assignment(
             environment,
             [MockPolicyClient(), MockPolicyClient()],
@@ -418,3 +422,142 @@ def test_assignment_identity_is_checked_at_worker_boundary():
     socket.incoming[0] = encode_header(header.pop('type'), **header)
     with pytest.raises(RuntimeError, match='assignment_id mismatch'):
         worker._receive_assignment(socket)
+
+
+@pytest.mark.parametrize('capacity', [1, 3])
+def test_unused_slots_do_not_reset_or_infer(capacity):
+    environment = MockVectorEnvironment(capacity, success_after=1)
+    environment.setup()
+    clients = [MockPolicyClient() for _ in range(capacity)]
+    results = execute_assignment(environment, clients,
+                                 EpisodeAssignment(_jobs(1)), 5, None, True)
+    assert len(results) == 1
+    assert [client.call_count for client in clients] == [1] + [0] * (
+        capacity - 1)
+    assert all(slot.current_task is None
+               for slot in environment.environments[1:])
+
+
+def _receive_event(coordinator,
+                   slot,
+                   kind,
+                   *,
+                   job=None,
+                   result=None,
+                   assignment_id=None,
+                   generation=None):
+    values = dict(
+        deployment_id='deployment',
+        worker_id=slot.worker_id,
+        generation=slot.generation if generation is None else generation,
+        assignment_id=assignment_id or slot.assignment.assignment_id)
+    if job is not None:
+        values['episode_id'] = job.episode_id
+    coordinator._worker_router.incoming = [
+        slot.routing_id,
+        encode_header(kind, **values),
+        empty_payload() if result is None else encode_frame(result)
+    ]
+
+
+def test_duplicate_results_are_idempotent_and_conflicts_fail():
+    jobs = _jobs(2)
+    coordinator, slot = _coordinator(2, jobs)
+    coordinator._dispatch_jobs()
+    env = MockVectorEnvironment(2, success_after=1)
+    env.setup()
+    results = execute_assignment(env, [MockPolicyClient() for _ in jobs],
+                                 slot.assignment, 5, None, True)
+    reporter = MockEvaluationReporter()
+    with EvaluationRun(
+            EvaluationSettings(episode_batch_size=2), SuccessRateEvaluator(),
+            reporter) as run:
+        run.start([jobs[0].task], 2)
+        _receive_event(coordinator, slot, 'episode_start', job=jobs[0])
+        coordinator._receive_worker_message(run)
+        result = to_jsonable(results[0])
+        for _ in range(2):
+            _receive_event(
+                coordinator, slot, 'episode_end', job=jobs[0], result=result)
+            coordinator._receive_worker_message(run)
+        assert len([
+            kind for kind, _ in reporter.events if kind == 'episode_end'
+        ]) == 1
+        assert len(coordinator._scheduling_state.results_by_episode_id) == 1
+        _receive_event(
+            coordinator,
+            slot,
+            'episode_end',
+            job=jobs[0],
+            result={
+                **result, 'success': False
+            })
+        with pytest.raises(RuntimeError, match='Conflicting duplicate'):
+            coordinator._receive_worker_message(run)
+        assert run.finish(results[0])['run']['completed_episodes'] == 1
+
+
+def test_old_assignment_and_generation_messages_cannot_complete_a_retry():
+    jobs = _jobs(2)
+    coordinator, slot = _coordinator(2, jobs)
+    coordinator._dispatch_jobs()
+    original = slot.assignment
+    coordinator._replace_worker_connection(
+        slot, routing_id=b'new', generation=1)
+    slot.simulator_ready = True
+    slot.recovery_deadline = None
+    coordinator._idle_worker_ids.append(slot.worker_id)
+    coordinator._dispatch_jobs()
+    assert slot.assignment.assignment_id != original.assignment_id
+    for kind in [
+            'episode_start', 'episode_end', 'assignment_end',
+            'environment_case_rejected'
+    ]:
+        _receive_event(
+            coordinator,
+            slot,
+            kind,
+            job=jobs[0],
+            assignment_id=original.assignment_id)
+        coordinator._receive_worker_message(None)
+        assert not slot.is_idle
+        _receive_event(coordinator, slot, kind, job=jobs[0], generation=0)
+        coordinator._receive_worker_message(None)
+    assert not coordinator._scheduling_state.results_by_episode_id
+    assert not coordinator._scheduling_state.started_episode_ids
+
+
+def test_report_failure_does_not_commit_completion():
+
+    class Reporter(MockEvaluationReporter):
+
+        def report_evaluation(self, event_type, payload):
+            if event_type == 'episode_end':
+                raise RuntimeError('report unavailable')
+            return super().report_evaluation(event_type, payload)
+
+    jobs = _jobs(1)
+    coordinator, slot = _coordinator(2, jobs)
+    coordinator._dispatch_jobs()
+    env = MockVectorEnvironment(2, success_after=1)
+    env.setup()
+    result = execute_assignment(
+        env, [MockPolicyClient(), MockPolicyClient()], slot.assignment, 5,
+        None, True)[0]
+    with EvaluationRun(
+            EvaluationSettings(episode_batch_size=2), SuccessRateEvaluator(),
+            Reporter()) as run:
+        run.start([jobs[0].task], 1)
+        _receive_event(coordinator, slot, 'episode_start', job=jobs[0])
+        coordinator._receive_worker_message(run)
+        _receive_event(
+            coordinator,
+            slot,
+            'episode_end',
+            job=jobs[0],
+            result=to_jsonable(result))
+        with pytest.raises(RuntimeError, match='report unavailable'):
+            coordinator._receive_worker_message(run)
+        assert not slot.completed_episode_ids
+        assert not coordinator._scheduling_state.results_by_episode_id
+        assert run.finish(None)['run']['completed_episodes'] == 0

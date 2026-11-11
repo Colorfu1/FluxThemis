@@ -108,8 +108,8 @@ class MockVectorEnvironment(BaseEnvironment):
             environment.setup()
 
     def reset_batch(
-            self, requests: Sequence[EnvironmentReset]
-    ) -> Sequence[tuple[Any, dict]]:
+        self, requests: Sequence[EnvironmentReset | None]
+    ) -> Sequence[tuple[Any, dict] | None]:
         if len(requests) != self.num_envs:
             raise ValueError('Reset requests must fill all slots')
         return [

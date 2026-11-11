@@ -291,7 +291,7 @@ def execute_assignment(
     policy.validate_options(save_videos=save_videos)
     policy.validate_assignment(assignment)
     jobs = assignment.jobs
-    if len(policy_clients) != len(jobs):
+    if len(policy_clients) != environment.num_envs:
         raise ValueError(
             'Assignment, environment and policy client sizes differ')
     if len({id(client) for client in policy_clients}) != len(policy_clients):
@@ -300,14 +300,25 @@ def execute_assignment(
                                  and execute_horizon < 1):
         raise ValueError(
             'Episode steps and execution horizon must be positive')
-    resets = environment.reset_batch([
+    requests = [
         EnvironmentReset(job.task, job.episode_index, job.environment_seed,
                          job.environment_case_index) for job in jobs
-    ])
-    if len(resets) != len(jobs):
+    ]
+    requests.extend([None] * (environment.num_envs - len(jobs)))
+    resets = environment.reset_batch(requests)
+    if len(resets) != environment.num_envs:
         raise ValueError('reset_batch returned the wrong number of slots')
     states = []
-    for job, client, (observation, info) in zip(jobs, policy_clients, resets):
+    for slot, (client, reset) in enumerate(zip(policy_clients, resets)):
+        if slot >= len(jobs):
+            if reset is not None:
+                raise ValueError('Unused reset slots must return None')
+            states.append(None)
+            continue
+        job = jobs[slot]
+        if reset is None:
+            raise ValueError('Active reset slots must return an observation')
+        observation, info = reset
         if not isinstance(info, Mapping):
             raise TypeError('Environment reset info must be a mapping')
         client.reset(job.task, job.episode_index, job.policy_seed)
@@ -326,17 +337,19 @@ def execute_assignment(
     try:
         if recorder is not None:
             recorder.capture(environment)
-        while any(state.result is None for state in states):
+        while any(state is not None and state.result is None
+                  for state in states):
             actions = [
                 state.next_action(execute_horizon)
-                if state.result is None else None for state in states
+                if state is not None and state.result is None else None
+                for state in states
             ]
             transitions = environment.step_batch(actions)
             if len(transitions) != len(states):
                 raise ValueError(
                     'step_batch returned the wrong number of slots')
             for state, transition in zip(states, transitions):
-                if state.result is not None:
+                if state is None or state.result is not None:
                     if transition is not None:
                         raise ValueError('Inactive slots must return None')
                     continue
@@ -361,7 +374,7 @@ def execute_assignment(
         if recorder is not None:
             recorder.abort()
         raise
-    return tuple(state.result for state in states)
+    return tuple(state.result for state in states if state is not None)
 
 
 def build_context(task: TaskSpec,

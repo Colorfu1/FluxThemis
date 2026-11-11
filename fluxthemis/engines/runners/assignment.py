@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+import uuid
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .episode import EpisodeJob
@@ -14,26 +15,20 @@ class EpisodeAssignment:
     """An ordered group of distinct episodes assigned to one worker."""
 
     jobs: tuple[EpisodeJob, ...]
+    assignment_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def __post_init__(self) -> None:
         if not self.jobs:
             raise ValueError('An assignment must contain at least one episode')
         if len({job.episode_id for job in self.jobs}) != len(self.jobs):
             raise ValueError('Assignment contains duplicate episode IDs')
-
-    @property
-    def assignment_id(self) -> str:
-        return self.jobs[0].episode_id
+        if not isinstance(self.assignment_id, str) or not self.assignment_id:
+            raise ValueError('Assignment ID must be a nonempty string')
 
 
 @dataclass(frozen=True)
 class ExecutionPolicy:
-    """First-version batch limitations, shared by execution and scheduling.
-
-    Scalar episodes retain retries, case replacement, recovery and video.
-    Native batches are atomic execution groups: acknowledged episode results
-    survive a failure, but unfinished groups cannot be retried or resumed.
-    """
+    """Capacity and execution restrictions shared by workers and scheduling."""
 
     batch_size: int = 1
 
@@ -41,18 +36,10 @@ class ExecutionPolicy:
         if type(self.batch_size) is not int or self.batch_size < 1:
             raise ValueError('episode_batch_size must be a positive integer')
 
-    def require_recovery(self, operation: str) -> None:
-        if self.batch_size != 1:
-            raise ValueError(f'Batch execution does not support {operation}; '
-                             'completed results are retained')
-
     def validate_options(self,
                          *,
                          save_videos: bool = False,
-                         resume: bool = False,
                          strict_worker_assignment: bool = False) -> None:
-        if resume:
-            self.require_recovery('resume')
         if self.batch_size != 1:
             if save_videos:
                 raise ValueError('Batch execution does not yet support video')
@@ -62,18 +49,8 @@ class ExecutionPolicy:
                     'fixed model-worker pairing is scalar-only')
 
     def validate_assignment(self, assignment: EpisodeAssignment) -> None:
-        if len(assignment.jobs) != self.batch_size:
-            raise ValueError('Assignment must fill all worker slots')
+        if len(assignment.jobs) > self.batch_size:
+            raise ValueError('Assignment exceeds worker capacity')
         if any(job.task != assignment.jobs[0].task for job in assignment.jobs):
             raise ValueError(
                 'This execution mode requires one task per assignment')
-
-    def validate_jobs(self, jobs: Sequence[EpisodeJob]) -> None:
-        counts: dict[str, int] = {}
-        for job in jobs:
-            counts[job.task.task_id] = counts.get(job.task.task_id, 0) + 1
-        for task_id, count in counts.items():
-            if count % self.batch_size:
-                raise ValueError(f'Task {task_id!r} has {count} episodes; '
-                                 'episode count must be divisible by '
-                                 f'episode_batch_size={self.batch_size}')

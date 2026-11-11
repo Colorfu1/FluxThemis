@@ -34,6 +34,7 @@ class EvaluationSettings:
     base_seed: int = 7
     episodes_per_task: int = 1
     episode_batch_size: int = 1
+    environment_case_rejection_limit: int = 100
     max_episode_steps: int = 1000
     execute_horizon: int | None = None
     task_ids: Sequence[str] | str | None = None
@@ -57,6 +58,10 @@ class EvaluationSettings:
         object.__setattr__(
             self, 'max_episode_steps',
             _positive_integer(self.max_episode_steps, 'max_episode_steps'))
+        object.__setattr__(
+            self, 'environment_case_rejection_limit',
+            _positive_integer(self.environment_case_rejection_limit,
+                              'environment_case_rejection_limit'))
         if self.execute_horizon is not None:
             object.__setattr__(
                 self, 'execute_horizon',
@@ -68,7 +73,6 @@ class EvaluationSettings:
         if not isinstance(self.strict_worker_assignment, bool):
             raise TypeError('strict_worker_assignment must be a boolean')
         ExecutionPolicy(self.episode_batch_size).validate_options(
-            resume=bool(self.resume_path),
             strict_worker_assignment=self.strict_worker_assignment)
         run_name = self.run_name or _default_run_name()
         _validate_run_name(run_name)
@@ -378,6 +382,8 @@ def _build_summary(settings: EvaluationSettings, state: _EvaluationState,
             settings.episodes_per_task,
             'episode_batch_size':
             settings.episode_batch_size,
+            'environment_case_rejection_limit':
+            settings.environment_case_rejection_limit,
             'episodes_per_task_by_task':
             _episodes_per_task_by_task(settings, state.selected_tasks),
             'max_episode_steps':
@@ -407,6 +413,8 @@ def _build_run_start_event(settings: EvaluationSettings,
         settings.episodes_per_task,
         'episode_batch_size':
         settings.episode_batch_size,
+        'environment_case_rejection_limit':
+        settings.environment_case_rejection_limit,
         'episodes_per_task_by_task':
         _episodes_per_task_by_task(settings, state.selected_tasks),
         'max_episode_steps':

@@ -8,7 +8,16 @@ from fluxthemis.structures import StepResult, TaskSpec
 
 
 class EnvironmentCaseRejected(RuntimeError):
-    """Signal that an environment case cannot start an episode."""
+    """Signal rejected initial cases, optionally identifying batch slots."""
+
+    def __init__(self, message: str, *, slots: Sequence[int] | None = None):
+        super().__init__(message)
+        self.slots = None if slots is None else tuple(slots)
+        if self.slots is not None and (not self.slots or len(set(
+                self.slots)) != len(self.slots) or any(
+                    type(slot) is not int or slot < 0 for slot in self.slots)):
+            raise ValueError(
+                'Rejected slots must be distinct nonnegative integers')
 
 
 @dataclass(frozen=True)
@@ -55,16 +64,19 @@ class BaseEnvironment(ABC):
         raise NotImplementedError
 
     def reset_batch(
-            self, requests: Sequence[EnvironmentReset]
-    ) -> Sequence[tuple[Any, dict]]:
+        self, requests: Sequence[EnvironmentReset | None]
+    ) -> Sequence[tuple[Any, dict] | None]:
         """Reset every slot, in order, without implicit episode restarts.
 
+        None marks an unused slot; return None without starting an episode.
         Native multi-environment adapters override this and ``step_batch``.
         The default bridges existing scalar adapters to the same runner.
         """
         if self.num_envs != 1 or len(requests) != 1:
             raise NotImplementedError('Adapter must implement reset_batch')
         request = requests[0]
+        if request is None:
+            return [None]
         return [
             self.reset(
                 request.task,

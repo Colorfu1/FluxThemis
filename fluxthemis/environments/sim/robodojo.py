@@ -712,20 +712,26 @@ class RoboDojoEnvironment(BaseEnvironment):
         )
 
     def reset_batch(
-            self, requests: Sequence[EnvironmentReset]
-    ) -> Sequence[tuple[Any, dict]]:
+        self, requests: Sequence[EnvironmentReset | None]
+    ) -> Sequence[tuple[Any, dict] | None]:
         if self.num_envs == 1:
             return super().reset_batch(requests)
         if len(requests) != self.num_envs:
-            raise ValueError('RoboDojo reset requires a full batch')
-        task = TaskSpec.from_value(requests[0].task)
+            raise ValueError('RoboDojo reset requires one entry per slot')
+        active = [
+            slot for slot, request in enumerate(requests)
+            if request is not None
+        ]
+        if not active:
+            raise ValueError('RoboDojo reset requires an active slot')
+        task = TaskSpec.from_value(requests[active[0]].task)
         if (task.task_id not in self._task_ids
-                or any(request.task.task_id != task.task_id
-                       for request in requests)):
+                or any(requests[slot].task.task_id != task.task_id
+                       for slot in active)):
             raise ValueError('RoboDojo batch must contain one configured task')
         layouts = [
-            self._nonnegative_integer(request.environment_case_index,
-                                      'environment_case_index')
+            None if request is None else self._nonnegative_integer(
+                request.environment_case_index, 'environment_case_index')
             for request in requests
         ]
         self._require_setup()
@@ -735,41 +741,65 @@ class RoboDojoEnvironment(BaseEnvironment):
             self._close_native_env()
         if self._physx_monitor is not None:
             self._physx_monitor.reset()
-        # Native reset loads one layout into each isolated scene. It never
-        # replenishes finished lanes; the runner owns assignment boundaries.
-        self._env.reset(seed=layouts)
-        if any(self._env.end_flag):
-            raise RuntimeError('RoboDojo batch reset rejected a layout; '
-                               'batch case replacement is unsupported')
-        self._check_batch_stability()
+        # Mark the native state for cleanup even when reset only partly
+        # succeeds. None seeds use RoboDojo's native inactive-lane mask.
         self._episode_active = True
         self._video_finalized = True
         self._batch_requests = tuple(requests)
-        self._batch_inactive = set()
+        self._batch_inactive = set(range(self.num_envs)) - set(active)
+        try:
+            self._env.reset(seed=layouts)
+        except Exception as exc:
+            if not _is_recoverable_robodojo_case_error(exc):
+                raise
+            rejected = self._rejected_reset_slots(active) or active
+            raise EnvironmentCaseRejected(
+                'RoboDojo initial layouts are unstable',
+                slots=rejected) from exc
+        self._validate_batch_reset(active)
         self._env.run_reward()
         if callable(getattr(self._env, 'get_score', None)):
             self._env.get_score()
-        observations = self._env.get_obs_batch()
-        if len(observations) != self.num_envs:
+        observations = self._env.get_obs_batch(env_idx_list=active)
+        self._validate_batch_reset(active)
+        if len(observations) != len(active):
             raise RuntimeError(
                 'RoboDojo returned an incomplete observation batch')
-        return [(robodojo_obs_to_flat(observation), {
-            'task_id': task.task_id,
-            'episode_index': request.episode_index,
-            'environment_seed': request.environment_seed,
-            'environment_case_index': layout,
-            'layout_index': layout,
-            'environment_slot': slot,
-        }) for slot, (
-            request, layout,
-            observation) in enumerate(zip(requests, layouts, observations))]
+        results = [None] * self.num_envs
+        for slot, observation in zip(active, observations):
+            request = requests[slot]
+            results[slot] = (robodojo_obs_to_flat(observation), {
+                'task_id': task.task_id,
+                'episode_index': request.episode_index,
+                'environment_seed': request.environment_seed,
+                'environment_case_index': layouts[slot],
+                'layout_index': layouts[slot],
+                'environment_slot': slot,
+            })
+        return results
+
+    def _rejected_reset_slots(self, active: Sequence[int]) -> list[int]:
+        unstable = set(getattr(self._env, 'unstable_envs', ()))
+        end_flags = getattr(self._env, 'end_flag', ())
+        return [
+            slot for slot in active
+            if slot in unstable or (slot < len(end_flags) and end_flags[slot])
+        ]
+
+    def _validate_batch_reset(self, active: Sequence[int]) -> None:
+        rejected = self._rejected_reset_slots(active)
+        if rejected:
+            raise EnvironmentCaseRejected(
+                f'RoboDojo initial layouts rejected in slots {rejected}',
+                slots=rejected)
 
     def _check_batch_stability(self) -> None:
-        unstable = getattr(self._env, 'unstable_envs', ())
+        unstable = set(getattr(self._env, 'unstable_envs',
+                               ())) - self._batch_inactive
         if unstable:
             raise RuntimeError(
                 f'RoboDojo batch contains unstable slots: {sorted(unstable)}; '
-                'batch case replacement is unsupported')
+                'cannot continue this simulator assignment')
 
     def step_batch(
             self,
@@ -797,6 +827,7 @@ class RoboDojoEnvironment(BaseEnvironment):
         self._env.take_action_batch(action_dicts, env_idx_list=active)
         self._check_batch_stability()
         observations = self._env.get_obs_batch(env_idx_list=active)
+        self._check_batch_stability()
         if len(observations) != len(active):
             raise RuntimeError(
                 'RoboDojo returned an incomplete observation batch')

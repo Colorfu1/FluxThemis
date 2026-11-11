@@ -213,7 +213,6 @@ class _SimulatorWorker:
                 evaluation_cfg.get('episode_batch_size', 1))
             policy.validate_options(
                 save_videos=save_videos,
-                resume=bool(evaluation_cfg.get('resume_path')),
                 strict_worker_assignment=evaluation_cfg.get(
                     'strict_worker_assignment', False))
             if environment.num_envs != policy.batch_size:
@@ -304,7 +303,8 @@ class _SimulatorWorker:
                 body.get('jobs'), list):
             raise TypeError('Assignment payload must contain a jobs list')
         assignment = EpisodeAssignment(
-            tuple(_episode_job_from_wire(value) for value in body['jobs']))
+            tuple(_episode_job_from_wire(value) for value in body['jobs']),
+            assignment_id=body.get('assignment_id'))
         if header.get('assignment_id') != assignment.assignment_id:
             raise RuntimeError('simulator assignment_id mismatch')
         return assignment
@@ -315,10 +315,16 @@ class _SimulatorWorker:
                             assignment: EpisodeAssignment, save_videos: bool,
                             video_dir: str | None, video_fps: int) -> None:
         with _episode_timeout(self.episode_timeout_s):
+            started = set()
 
             def report_episode_start(job: EpisodeJob) -> None:
-                _send_episode_event(socket, self._message_identity,
-                                    'episode_start', job.episode_id)
+                started.add(job.episode_id)
+                _send_episode_event(
+                    socket,
+                    self._message_identity,
+                    'episode_start',
+                    job.episode_id,
+                    assignment_id=assignment.assignment_id)
 
             def report_episode_end(job: EpisodeJob, result: Any) -> None:
                 _send_episode_event(
@@ -326,6 +332,7 @@ class _SimulatorWorker:
                     self._message_identity,
                     'episode_end',
                     job.episode_id,
+                    assignment_id=assignment.assignment_id,
                     payload=encode_frame(to_jsonable(result)))
 
             try:
@@ -345,14 +352,26 @@ class _SimulatorWorker:
                     video_worker_id=self.worker_id,
                 )
             except EnvironmentCaseRejected as exc:
-                ExecutionPolicy(environment.num_envs).require_recovery(
-                    'environment case replacement')
-                _send_episode_event(
-                    socket,
-                    self._message_identity,
-                    'environment_case_rejected',
-                    assignment.jobs[0].episode_id,
-                    message=str(exc))
+                if started:
+                    # Execution failures retry the same initial condition;
+                    # only reset failures may consume a replacement layout.
+                    raise RuntimeError(
+                        'Environment case failed after episode start') from exc
+                rejected = set(
+                    range(len(assignment.jobs)) if exc.slots is
+                    None else exc.slots)
+                if not rejected <= set(range(len(assignment.jobs))):
+                    raise ValueError(
+                        'Rejected slot is outside the assignment') from exc
+                for slot, job in enumerate(assignment.jobs):
+                    _send_episode_event(
+                        socket,
+                        self._message_identity,
+                        'environment_case_rejected',
+                        job.episode_id,
+                        assignment_id=assignment.assignment_id,
+                        replace_case=slot in rejected,
+                        message=str(exc))
             # Results alone do not release a worker. All simulator execution
             # and per-episode callbacks must return before accepting more work.
             socket.send_multipart([

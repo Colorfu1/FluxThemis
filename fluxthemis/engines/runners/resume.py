@@ -13,8 +13,6 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from .assignment import ExecutionPolicy
-
 
 def atomic_json(path, value):
     path = Path(path)
@@ -64,12 +62,13 @@ def manifest(start):
     keys = ('base_seed', 'episodes_per_task', 'episodes_per_task_by_task',
             'max_episode_steps', 'execute_horizon', 'stop_on_success',
             'task_ids', 'tasks', 'total_episodes', 'strict_worker_assignment')
-    return {key: start.get(key) for key in keys}
+    value = {key: start.get(key) for key in keys}
+    value['environment_case_rejection_limit'] = start.get(
+        'environment_case_rejection_limit', 100)
+    return value
 
 
 def canonical_jobs(start):
-    ExecutionPolicy(start.get('episode_batch_size',
-                              1)).require_recovery('resume')
     task_ids = [task['task_id'] for task in start['tasks']]
     counts = start['episodes_per_task_by_task']
     if (task_ids != start['task_ids'] or not task_ids
@@ -171,7 +170,7 @@ def build_bundle(directory):
     directory = Path(directory).resolve()
     journal = directory / 'events.jsonl'
     rows = read_journal(journal)
-    start, _, completed = validate_journal(rows)
+    start, starts, completed = validate_journal(rows)
     inherited = {}
     if start.get('resumed_from'):
         inherited = read_bundle(directory / 'resume_input.json')
@@ -192,6 +191,21 @@ def build_bundle(directory):
                 raise ValueError(f'Replayed result changed {field}')
     merged.update(completed)
     jobs = canonical_jobs(start)
+    previously_started = {
+        identity(job)
+        for job in inherited.get('jobs', []) if job.get('started', False)
+    }
+    for job in jobs:
+        job['started'] = (
+            identity(job) in starts or identity(job) in previously_started)
+    pending_cases = {
+        identity(job): job['environment_case_index']
+        for job in inherited.get('jobs', [])
+    }
+    pending_cases.update({
+        key: body['environment_case_index']
+        for key, body in starts.items()
+    })
     used = {task: set() for task in start['task_ids']}
     # Reserve the actual completed layouts first: rejected defaults may have
     # been replaced with indexes that overlap another episode's default case.
@@ -203,6 +217,17 @@ def build_bundle(directory):
                 raise ValueError('Invalid or duplicate completed layout')
             job['environment_case_index'] = case
             used[key[0]].add(case)
+    # An acknowledged start fixes the initial condition even when its result
+    # was lost. Reserve these before assigning defaults to unstarted episodes.
+    for job in jobs:
+        key = identity(job)
+        if key not in merged and key in pending_cases:
+            case = pending_cases[key]
+            if type(case) is not int or case < 0 or case in used[key[0]]:
+                raise ValueError(
+                    'Invalid or duplicate pending recovery layout')
+            job['environment_case_index'] = case
+            used[key[0]].add(case)
     next_cases = {
         task: max([start['episodes_per_task_by_task'][task] - 1, *cases]) + 1
         for task, cases in used.items()
@@ -211,13 +236,14 @@ def build_bundle(directory):
     # Unrecorded layout rejections may be encountered again after recovery.
     for job in jobs:
         task = job['task_id']
-        if identity(job) not in merged:
+        if identity(job) not in merged and identity(job) not in pending_cases:
             case = job['environment_case_index']
             if case in used[task]:
                 case = next_cases[task]
                 next_cases[task] += 1
             job['environment_case_index'] = case
             used[task].add(case)
+            next_cases[task] = max(next_cases[task], case + 1)
     next_cases = {task: max(cases) + 1 for task, cases in used.items()}
     live_starts = [
         datetime.fromisoformat(e['payload']['started_at']).timestamp()
@@ -261,6 +287,8 @@ def validate_bundle(data):
         raise ValueError('Recovery jobs do not match the full task manifest')
     cases = set()
     for key, job in jobs.items():
+        if type(job.get('started', False)) is not bool:
+            raise ValueError('Invalid recovery episode started flag')
         for field in ('global_episode_number', 'policy_seed',
                       'environment_seed'):
             if job[field] != original[key][field]:

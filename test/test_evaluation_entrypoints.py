@@ -89,7 +89,7 @@ def test_launcher_imports_current_checkout(tmp_path, stale_package, dry_run):
 
 
 @pytest.mark.parametrize('capacity', [1, 2])
-def test_prepare_resume_preserves_scalar_results_and_rejects_batches(
+def test_prepare_resume_preserves_scalar_and_batch_results(
         tmp_path, capacity, resume):
     source = tmp_path / 'stopped_run'
     source.mkdir()
@@ -142,18 +142,14 @@ def test_prepare_resume_preserves_scalar_results_and_rejects_batches(
         local=local,
         simulator_workers=1,
         output_root=str(tmp_path))
-    if capacity == 2:
-        with pytest.raises(ValueError, match='does not support resume'):
-            resume.prepare_resume(source, settings)
-    else:
-        plan, lock = resume.prepare_resume(source, settings)
-        try:
-            bundle = resume.recovery.read_bundle(
-                Path(plan['output']) / 'resume_input.json')
-            assert len(bundle['completed']) == 1
-            assert bundle['completed'][0]['end']['policy_seed'] == 7
-            assert [job['policy_seed'] for job in bundle['jobs']] == [7, 8]
-            assert [job['environment_case_index']
-                    for job in bundle['jobs']] == [0, 1]
-        finally:
-            lock.close()
+    plan, lock = resume.prepare_resume(source, settings)
+    try:
+        bundle = resume.recovery.read_bundle(
+            Path(plan['output']) / 'resume_input.json')
+        assert len(bundle['completed']) == 1
+        assert bundle['completed'][0]['end']['policy_seed'] == 7
+        assert [job['policy_seed'] for job in bundle['jobs']] == [7, 8]
+        assert [job['environment_case_index']
+                for job in bundle['jobs']] == [0, 1]
+    finally:
+        lock.close()

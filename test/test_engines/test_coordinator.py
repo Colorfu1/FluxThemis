@@ -1,3 +1,5 @@
+import pytest
+
 from fluxthemis.engines.runners.assignment import EpisodeAssignment
 from fluxthemis.engines.runners.coordinator import (
     DistributedEvaluationCoordinator, _SchedulingState, _WorkerSlot)
@@ -53,6 +55,7 @@ def _coordinator_with_active_job(job):
             worker_id=slot.worker_id,
             generation=slot.generation,
             episode_id=job.episode_id,
+            assignment_id=slot.assignment.assignment_id,
         ),
         empty_payload(),
     ])
@@ -70,7 +73,6 @@ def test_rejected_job_requeues_same_slot_with_next_environment_case():
     coordinator, slot, evaluation_run = _coordinator_with_active_job(job)
     scheduling_state = _SchedulingState.from_jobs(jobs)
     scheduling_state.pending_jobs.clear()
-    scheduling_state.started_episode_ids.add(job.episode_id)
     coordinator._scheduling_state = scheduling_state
 
     coordinator._receive_worker_message(evaluation_run)
@@ -91,7 +93,7 @@ def test_rejected_job_requeues_same_slot_with_next_environment_case():
         deployment_id="deployment",
         worker_id=slot.worker_id,
         generation=slot.generation,
-        assignment_id=job.episode_id)
+        assignment_id=slot.assignment.assignment_id)
     coordinator._receive_worker_message(evaluation_run)
     assert slot.is_idle
     assert coordinator._worker_router.sent == []
@@ -133,3 +135,51 @@ def test_reconnecting_worker_requeues_active_episode():
     assert slot.generation == 1
     assert slot.recovery_deadline is not None
     assert coordinator._worker_router.sent == []
+
+
+def test_case_replacement_has_a_per_episode_limit():
+    jobs = build_episode_jobs([TaskSpec('task')], 1, 7, 'run')
+    coordinator, slot, _ = _coordinator_with_active_job(jobs[0])
+    coordinator._scheduling_state = _SchedulingState.from_jobs(jobs)
+    coordinator._scheduling_state.pending_jobs.clear()
+    run = EvaluationRun(
+        EvaluationSettings(environment_case_rejection_limit=1),
+        SuccessRateEvaluator(), MockEvaluationReporter())
+    coordinator._receive_worker_message(run)
+    coordinator._receive_worker_message(run)
+    assert len(coordinator._scheduling_state.pending_jobs) == 1
+    retry = coordinator._scheduling_state.pending_jobs.popleft()
+    slot.assignment = EpisodeAssignment((retry, ))
+    slot.completed_episode_ids.clear()
+    coordinator._worker_router.incoming[1] = encode_header(
+        'environment_case_rejected',
+        deployment_id='deployment',
+        worker_id=slot.worker_id,
+        generation=0,
+        episode_id=retry.episode_id,
+        assignment_id=slot.assignment.assignment_id)
+    with pytest.raises(RuntimeError, match='rejection limit'):
+        coordinator._receive_worker_message(run)
+    assert (
+        coordinator._scheduling_state.next_environment_case_index_by_task == {
+            'task': 2
+        })
+
+
+def test_case_reset_failure_after_start_retries_same_layout():
+    jobs = build_episode_jobs([TaskSpec('task')], 1, 7, 'run')
+    coordinator, slot, run = _coordinator_with_active_job(jobs[0])
+    coordinator.simulator_restart_limit = 1
+    state = coordinator._scheduling_state = _SchedulingState.from_jobs(jobs)
+    state.pending_jobs.clear()
+    # Restored starts fix the layout without suppressing the new session's
+    # first episode_start event.
+    state.restored_started_episode_ids.add(jobs[0].episode_id)
+    coordinator._receive_worker_message(run)
+    assert state.pending_jobs.popleft() == jobs[0]
+    assert state.next_environment_case_index_by_task == {'task': 1}
+    assert not state.rejection_counts_by_episode_id
+    assert state.restart_counts_by_episode_id == {jobs[0].episode_id: 1}
+    slot.completed_episode_ids.clear()
+    with pytest.raises(RuntimeError, match='restart limit'):
+        coordinator._receive_worker_message(run)

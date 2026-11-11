@@ -296,7 +296,6 @@ def load_config(path, *, mode=None, overrides=None):
     evaluation.save_videos = save_videos
     execution_policy.validate_options(
         save_videos=save_videos,
-        resume=bool(resume['from_dir'] or evaluation.get('resume_path')),
         strict_worker_assignment=evaluation.strict_worker_assignment)
     local = dict(
         python=path_value(

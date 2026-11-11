@@ -61,7 +61,7 @@ class _BatchNativeEnvironment:
 
     def reset(self, seed):
         self.reset_calls.append(seed)
-        self.end_flag = [False] * len(seed)
+        self.end_flag = [value is None for value in seed]
         self.success = [True] * len(seed)
         self.take_action_cnt = [0] * len(seed)
 
@@ -130,12 +130,13 @@ def test_robodojo_batch_routes_active_slots_and_resets_layouts(
 
 def test_robodojo_batch_rejects_partial_and_unstable_reset(batch_environment):
     env, native, requests = batch_environment
-    with pytest.raises(ValueError, match='full batch'):
+    with pytest.raises(ValueError, match='one entry per slot'):
         env.reset_batch(requests[:2])
     assert not native.reset_calls
     native.unstable_envs = {1}
-    with pytest.raises(RuntimeError, match='unstable slots'):
+    with pytest.raises(EnvironmentCaseRejected, match='slots') as error:
         env.reset_batch(requests)
+    assert error.value.slots == (1, )
 
 
 def test_robodojo_batch_scores_are_slot_specific(batch_environment):
@@ -147,3 +148,40 @@ def test_robodojo_batch_scores_are_slot_specific(batch_environment):
     env.reset_batch(requests)
     transitions = env.step_batch([1, 2, 3])
     assert [item.score for item in transitions] == [1.0, 0.25, 0.75]
+
+
+def test_robodojo_tail_batch_masks_unused_native_lanes(batch_environment):
+    env, native, requests = batch_environment
+    observations = env.reset_batch([requests[0], None, requests[2]])
+    assert observations[1] is None
+    assert observations[2][1]['layout_index'] == 12
+    assert native.reset_calls == [[10, None, 12]]
+    transitions = env.step_batch([1, None, 2])
+    assert transitions[1] is None
+    assert native.action_calls[-1][1] == [0, 2]
+
+
+def test_robodojo_inactive_lane_cannot_reject_tail_batch(batch_environment):
+    env, native, requests = batch_environment
+    native.unstable_envs = {1}
+    assert env.reset_batch([requests[0], None, None])[0] is not None
+    assert env.step_batch([1, None, None])[1:] == [None, None]
+
+
+def test_partial_native_reset_failure_identifies_slot_and_cleans_up(
+        batch_environment, monkeypatch):
+    env, native, requests = batch_environment
+    reset = native.reset
+
+    def unstable(seed):
+        reset(seed)
+        native.end_flag[1] = True
+        raise UnStableError('partial reset')
+
+    monkeypatch.setattr(native, 'reset', unstable)
+    with pytest.raises(EnvironmentCaseRejected) as error:
+        env.reset_batch(requests)
+    assert error.value.slots == (1, )
+    monkeypatch.setattr(native, 'reset', reset)
+    env.reset_batch(requests)
+    assert native.close_calls == 1

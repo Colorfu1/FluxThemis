@@ -62,33 +62,46 @@ bash scripts/run_evaluation.sh \
 `num_envs=4`，最多同时执行 8 个 episode。模型服务仍独立启动，模型请求按
 episode 分别发送，不要求模型一次推理整个环境 batch。
 
-当前执行模式使用同任务、满批分组，每个任务的实际 episode 配额（包括覆盖值）
-必须能被 `episode_batch_size` 整除。使用 dynamic 调度；fixed 模型 worker
-配对、批量录像和批量恢复暂不支持。批量运行中途失败或拒绝初始 case 时，保留
-已确认的 episode 结果并终止运行，不重试剩余部分。启动阶段仍使用原有的启动
-重试上限；单环境的重试、case 替换、恢复和录像行为保持不变。执行超时覆盖整组。
-模拟器进程意外退出时，coordinator 先判断是否允许恢复，再由 supervisor 启动
-替代进程；不可恢复的失败先报告已有结果和失败状态，再结束运行。
+每组分配同一个任务的 episode，数量最多为 `episode_batch_size`，允许尾批。
+例如容量为 10、任务配额为 25 时，分成 10、10、5；不足容量的槽位不启动
+episode，也不执行推理。使用 dynamic 调度；fixed 模型 worker 配对和批量录像暂不支持。
+执行超时覆盖整组。
 
-每个环境分别累计步数、成功状态、Score 和动作片段，结束后立即上报结果；整组
-完成后 worker 才接收下一组。episode ID、seed 和 case index 仍按完整任务列表
+模拟器进程退出时，coordinator 保留已确认的结果，只重新排队未完成的 episode，
+然后允许 supervisor 启动替代进程。重试从原来的初始状态开始，保留 episode ID、
+seed 和 layout；每个 episode 受 `--simulator-restart-limit` 约束。
+批量运行也支持本文的 `--resume` 流程：重放已确认且写入日志的结果，再执行剩余
+任务。已确认开始的 episode 会保留实际选定的 layout，包括替换后的初始场景。
+
+每次分配有独立的执行编号，旧进程或旧分配的迟到消息不影响新分配。同一次分配的
+重复结果只计一次；结果内容冲突会报错。结果必须先被 reporter 确认，才能计入
+完成数或释放 worker。每个环境分别累计步数、成功状态、Score 和动作片段，结束后
+立即上报结果；整组结束后 worker 才接收下一组。episode ID 和 seed 按完整任务列表
 生成，不随 worker 数量或完成顺序变化。
+
+reset 阶段拒绝初始 case 时，由 coordinator 为受影响的槽位分配未使用的 case，
+其余槽位保留原 case 重新排队。每个 episode 的拒绝上限由
+`themis.evaluation.environment_case_rejection_limit` 控制，默认 100 次；
+可用 layout 也必须满足适配器要求。episode 开始后的执行异常按进程故障重试原
+case，不替换初始场景；正常失败和达到步数上限仍是完成的评测结果。
 
 适配器接入要求：
 
 - 继承 `BaseEnvironment`，暴露 `num_envs`，实现 `reset_batch(requests)` 和
   `step_batch(actions)`；现有单环境适配器可继续只实现 `reset` / `step`。
-- reset 接收按槽位排列的 `EnvironmentReset`，包含任务、episode index、环境
-  seed 和 case index，返回同长度的 `(observation, info)` 序列。
-- step 接收每槽位一个动作，返回同长度的 `StepResult` 序列。已结束的槽位输入和
-  输出均为 `None`，适配器负责冻结或隔离它们，不能影响仍在运行的 episode。
+- reset 接收长度为 `num_envs` 的序列。活动槽位是 `EnvironmentReset`，包含任务、
+  episode index、环境 seed 和 case index，返回 `(observation, info)`；未使用的
+  槽位输入和输出均为 `None`。
+- step 接收每槽位一个动作，返回同长度的 `StepResult` 序列。未使用或已结束的槽位
+  输入和输出均为 `None`，适配器负责冻结或隔离它们，不能影响仍在运行的 episode。
   不得隐式 auto-reset；终止观测和指标必须属于刚结束的 episode。
+- 初始 case 被拒绝时抛出 `EnvironmentCaseRejected`；可通过 `slots` 指定受影响的
+  槽位编号。省略 `slots` 表示此次分配的所有初始 case 都被拒绝。
 
 RoboDojo 已通过原生 `reset`、`get_obs_batch` 和 `take_action_batch` 接入，
-在同一个 Isaac Sim 进程中为各槽位加载独立 layout。结束槽位不再接收动作，
-不自动补入新 episode；遇到不稳定场景则终止 batch，不替换 layout。
-`MockVectorEnvironment` 提供 CPU 示例；其他 benchmark 仍需实现各自的
-批量接口。单环境和多环境共用同一个 episode 执行循环。
+在同一个 Isaac Sim 进程中为活动槽位加载独立 layout，通过 None seed 禁用尾批的
+空槽位，并按槽位识别 reset 拒绝。`MockVectorEnvironment` 提供 CPU 示例；其他
+benchmark 仍需实现各自的批量接口。单环境和多环境共用同一个 episode 执行循环。
 
 ## 连接与端口
 
