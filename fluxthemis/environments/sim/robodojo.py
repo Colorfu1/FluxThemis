@@ -20,7 +20,7 @@ import numpy as np
 from fluxthemis.engines.utils import ENVIRONMENTS
 from fluxthemis.structures import StepResult, TaskSpec
 
-from ..base import BaseEnvironment, EnvironmentCaseRejected
+from ..base import BaseEnvironment, EnvironmentCaseRejected, EnvironmentReset
 from .robodojo_log_capture import FileLogCapture
 
 ROBODOJO_BENCHMARK = 'RoboDojo'
@@ -393,10 +393,10 @@ class RoboDojoEnvironment(BaseEnvironment):
         if not isinstance(save_videos, bool):
             raise TypeError('save_videos must be a boolean')
         num_envs = self._nonnegative_integer(num_envs, 'num_envs')
-        if num_envs != 1:
-            raise ValueError(
-                'RoboDojoEnvironment currently drives a single environment; '
-                'num_envs must be 1')
+        if num_envs < 1:
+            raise ValueError('num_envs must be positive')
+        if num_envs > 1 and save_videos:
+            raise ValueError('RoboDojo batch video is not supported')
         seed = self._nonnegative_integer(seed, 'seed')
 
         root_value = robodojo_root or os.environ.get(
@@ -711,7 +711,120 @@ class RoboDojoEnvironment(BaseEnvironment):
             info=info,
         )
 
-    def _current_score(self, success: bool | None) -> float:
+    def reset_batch(
+            self, requests: Sequence[EnvironmentReset]
+    ) -> Sequence[tuple[Any, dict]]:
+        if self.num_envs == 1:
+            return super().reset_batch(requests)
+        if len(requests) != self.num_envs:
+            raise ValueError('RoboDojo reset requires a full batch')
+        task = TaskSpec.from_value(requests[0].task)
+        if (task.task_id not in self._task_ids
+                or any(request.task.task_id != task.task_id
+                       for request in requests)):
+            raise ValueError('RoboDojo batch must contain one configured task')
+        layouts = [
+            self._nonnegative_integer(request.environment_case_index,
+                                      'environment_case_index')
+            for request in requests
+        ]
+        self._require_setup()
+        if task.task_id != self._task.task_id:
+            self._activate_task(task)
+        elif self._episode_active:
+            self._close_native_env()
+        if self._physx_monitor is not None:
+            self._physx_monitor.reset()
+        # Native reset loads one layout into each isolated scene. It never
+        # replenishes finished lanes; the runner owns assignment boundaries.
+        self._env.reset(seed=layouts)
+        if any(self._env.end_flag):
+            raise RuntimeError('RoboDojo batch reset rejected a layout; '
+                               'batch case replacement is unsupported')
+        self._check_batch_stability()
+        self._episode_active = True
+        self._video_finalized = True
+        self._batch_requests = tuple(requests)
+        self._batch_inactive = set()
+        self._env.run_reward()
+        if callable(getattr(self._env, 'get_score', None)):
+            self._env.get_score()
+        observations = self._env.get_obs_batch()
+        if len(observations) != self.num_envs:
+            raise RuntimeError(
+                'RoboDojo returned an incomplete observation batch')
+        return [(robodojo_obs_to_flat(observation), {
+            'task_id': task.task_id,
+            'episode_index': request.episode_index,
+            'environment_seed': request.environment_seed,
+            'environment_case_index': layout,
+            'layout_index': layout,
+            'environment_slot': slot,
+        }) for slot, (
+            request, layout,
+            observation) in enumerate(zip(requests, layouts, observations))]
+
+    def _check_batch_stability(self) -> None:
+        unstable = getattr(self._env, 'unstable_envs', ())
+        if unstable:
+            raise RuntimeError(
+                f'RoboDojo batch contains unstable slots: {sorted(unstable)}; '
+                'batch case replacement is unsupported')
+
+    def step_batch(
+            self,
+            actions: Sequence[Any | None]) -> Sequence[StepResult | None]:
+        if self.num_envs == 1:
+            return super().step_batch(actions)
+        self._require_episode()
+        if len(actions) != self.num_envs:
+            raise ValueError('RoboDojo step requires one entry per slot')
+        active = [
+            slot for slot, action in enumerate(actions) if action is not None
+        ]
+        if self._batch_inactive.intersection(active):
+            raise ValueError('Cannot reactivate a finished RoboDojo slot')
+        action_dicts = [self._action_to_dict(actions[slot]) for slot in active]
+        for slot, action in enumerate(actions):
+            if action is None:
+                self._batch_inactive.add(slot)
+                self._env.end_flag[slot] = True
+        results = [None] * self.num_envs
+        if not active:
+            return results
+        # Only active lanes receive control/reward updates. Native scenes have
+        # separate objects and robots, so finished lanes cannot affect peers.
+        self._env.take_action_batch(action_dicts, env_idx_list=active)
+        self._check_batch_stability()
+        observations = self._env.get_obs_batch(env_idx_list=active)
+        if len(observations) != len(active):
+            raise RuntimeError(
+                'RoboDojo returned an incomplete observation batch')
+        for slot, observation in zip(active, observations):
+            request = self._batch_requests[slot]
+            terminated = bool(self._env.end_flag[slot])
+            success = bool(self._env.success[slot]) if terminated else None
+            score = self._current_score(success, slot)
+            results[slot] = StepResult(
+                observation=robodojo_obs_to_flat(observation),
+                reward=float(bool(success)) if terminated else 0.0,
+                terminated=terminated,
+                truncated=False,
+                success=success,
+                score=score,
+                info={
+                    'task_id': request.task.task_id,
+                    'step': int(self._env.take_action_cnt[slot]),
+                    'score': score,
+                    'environment_case_index': request.environment_case_index,
+                    'layout_index': request.environment_case_index,
+                    'environment_slot': slot,
+                })
+            if terminated:
+                self._batch_inactive.add(slot)
+        return results
+
+    def _current_score(self, success: bool | None, slot: int = 0) -> float:
         if success:
             return 1.0
         if not callable(getattr(self._env, 'get_score', None)):
@@ -723,7 +836,7 @@ class RoboDojoEnvironment(BaseEnvironment):
                 'RoboDojo task exposes get_score() without a compatible '
                 'reward_manager.get_score()')
         try:
-            score = float(get_score()[0]) / 100.0
+            score = float(get_score()[slot]) / 100.0
         except (IndexError, TypeError, ValueError) as exc:
             raise RuntimeError(
                 'RoboDojo reward manager returned an invalid score') from exc
@@ -901,6 +1014,8 @@ class RoboDojoEnvironment(BaseEnvironment):
                                   output_dir: str | None) -> None:
         if not isinstance(enabled, bool):
             raise TypeError('enabled must be a boolean')
+        if enabled and self.num_envs > 1:
+            raise ValueError('RoboDojo batch video is not supported')
         if output_dir is not None:
             if not isinstance(output_dir, (str, os.PathLike)):
                 raise TypeError('output_dir must be a path or None')
@@ -958,7 +1073,7 @@ class RoboDojoEnvironment(BaseEnvironment):
         eval_cfg['task_name'] = self._task.task_id
         eval_cfg['num_envs'] = self.num_envs
         eval_cfg['device_id'] = self._device_id
-        eval_cfg['eval_batch'] = False
+        eval_cfg['eval_batch'] = self.num_envs > 1
         eval_cfg['policy_name'] = 'fluxthemis'
         eval_cfg['additional_info'] = 'fluxthemis'
         eval_cfg['seed'] = self.seed

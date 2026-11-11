@@ -84,9 +84,11 @@ episode 分别发送，不要求模型一次推理整个环境 batch。
   输出均为 `None`，适配器负责冻结或隔离它们，不能影响仍在运行的 episode。
   不得隐式 auto-reset；终止观测和指标必须属于刚结束的 episode。
 
-这套公共接口不会自动赋予既有 benchmark 原生多环境能力。当前分支提供
-`MockVectorEnvironment` 作为无需 GPU 的接口示例；真实模拟器需在适配器中接入
-其批量 reset、step 和隔离逻辑。单环境和多环境共用同一个 episode 执行循环。
+RoboDojo 已通过原生 `reset`、`get_obs_batch` 和 `take_action_batch` 接入，
+在同一个 Isaac Sim 进程中为各槽位加载独立 layout。结束槽位不再接收动作，
+不自动补入新 episode；遇到不稳定场景则终止 batch，不替换 layout。
+`MockVectorEnvironment` 提供 CPU 示例；其他 benchmark 仍需实现各自的
+批量接口。单环境和多环境共用同一个 episode 执行循环。
 
 ## 连接与端口
 
