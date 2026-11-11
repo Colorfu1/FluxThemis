@@ -289,8 +289,9 @@ def execute_assignment(
     """
     policy = ExecutionPolicy(environment.num_envs)
     policy.validate_options(save_videos=save_videos)
+    policy.validate_assignment(assignment)
     jobs = assignment.jobs
-    if len(jobs) != policy.batch_size or len(policy_clients) != len(jobs):
+    if len(policy_clients) != len(jobs):
         raise ValueError(
             'Assignment, environment and policy client sizes differ')
     if len({id(client) for client in policy_clients}) != len(policy_clients):

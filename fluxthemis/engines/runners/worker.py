@@ -56,9 +56,19 @@ class SimulatorWorkerSupervisor:
         self._context = multiprocessing.get_context('spawn')
 
     def run(self) -> None:
+        import zmq
+
         os.environ['CUDA_VISIBLE_DEVICES'] = self.device
         os.environ.pop('LOCAL_RANK', None)
         os.environ['MUJOCO_EGL_DEVICE_ID'] = self.device
+        with zmq.Context() as context, context.socket(zmq.DEALER) as socket:
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.IDENTITY,
+                              f'{self.worker_id}:supervisor'.encode())
+            socket.connect(self.rollout_endpoint)
+            self._run_generations(socket)
+
+    def _run_generations(self, socket: Any) -> None:
         generation = 0
         while True:
             ready_event = self._context.Event()
@@ -111,6 +121,7 @@ class SimulatorWorkerSupervisor:
                 return
             restart_reason = ('startup timeout' if startup_timed_out else
                               f'exit code {process.exitcode}')
+            self._request_restart(socket, generation, restart_reason)
             generation += 1
             print(
                 f'[FluxThemis] restarting {self.worker_id} after '
@@ -118,6 +129,34 @@ class SimulatorWorkerSupervisor:
                 flush=True,
             )
             time.sleep(0.5)
+
+    def _request_restart(self, socket: Any, generation: int,
+                         reason: str) -> None:
+        socket.send_multipart([
+            encode_header(
+                'worker_exit',
+                deployment_id=self.deployment_id,
+                worker_id=self.worker_id,
+                generation=generation,
+                device=self.device,
+                reason=reason),
+            empty_payload(),
+        ])
+        # The coordinator must finish failure reporting before shutting down
+        # the rank; raising immediately could kill its reporter in mid-write.
+        if not socket.poll(int(_SIMULATOR_STARTUP_TIMEOUT_S * 1000)):
+            raise TimeoutError('Coordinator did not decide simulator recovery')
+        frames = socket.recv_multipart()
+        header = decode_header(frames[0])
+        if (header.get('deployment_id') != self.deployment_id
+                or header.get('worker_id') != self.worker_id
+                or header.get('generation') != generation):
+            raise RuntimeError('Simulator recovery response identity mismatch')
+        if header['type'] == 'shutdown_worker':
+            raise RuntimeError(
+                f'Simulator {self.worker_id} stopped after {reason}')
+        if header['type'] != 'restart_worker':
+            raise RuntimeError('Unexpected simulator recovery response')
 
 
 class _SimulatorWorker:

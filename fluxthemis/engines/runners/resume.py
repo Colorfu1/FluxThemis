@@ -2,7 +2,6 @@
 
 Only acknowledged episode_end events are reused. A fresh report session
 receives them through the existing protocol. Unfinished episodes reset.
-This module deliberately uses only the standard library, including on the host.
 """
 
 from __future__ import annotations
@@ -13,6 +12,8 @@ import math
 import os
 from datetime import datetime
 from pathlib import Path
+
+from .assignment import ExecutionPolicy
 
 
 def atomic_json(path, value):
@@ -67,8 +68,6 @@ def manifest(start):
 
 
 def canonical_jobs(start):
-    from .assignment import ExecutionPolicy
-
     ExecutionPolicy(start.get('episode_batch_size',
                               1)).require_recovery('resume')
     task_ids = [task['task_id'] for task in start['tasks']]

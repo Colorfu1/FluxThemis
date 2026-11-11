@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class EpisodeAssignment:
-    """One ordered, same-task group occupying all slots in a worker."""
+    """An ordered group of distinct episodes assigned to one worker."""
 
     jobs: tuple[EpisodeJob, ...]
 
@@ -20,8 +20,6 @@ class EpisodeAssignment:
             raise ValueError('An assignment must contain at least one episode')
         if len({job.episode_id for job in self.jobs}) != len(self.jobs):
             raise ValueError('Assignment contains duplicate episode IDs')
-        if any(job.task != self.jobs[0].task for job in self.jobs):
-            raise ValueError('An assignment must contain one task only')
 
     @property
     def assignment_id(self) -> str:
@@ -62,6 +60,13 @@ class ExecutionPolicy:
                 raise ValueError(
                     'Batch execution requires dynamic scheduling; '
                     'fixed model-worker pairing is scalar-only')
+
+    def validate_assignment(self, assignment: EpisodeAssignment) -> None:
+        if len(assignment.jobs) != self.batch_size:
+            raise ValueError('Assignment must fill all worker slots')
+        if any(job.task != assignment.jobs[0].task for job in assignment.jobs):
+            raise ValueError(
+                'This execution mode requires one task per assignment')
 
     def validate_jobs(self, jobs: Sequence[EpisodeJob]) -> None:
         counts: dict[str, int] = {}

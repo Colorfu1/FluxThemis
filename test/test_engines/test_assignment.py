@@ -163,8 +163,9 @@ def test_batch_limits_and_scalar_recovery_compatibility():
         ExecutionPolicy().validate_options(**options)
     with pytest.raises(ValueError, match='divisible'):
         policy.validate_jobs(_jobs(3))
+    mixed = EpisodeAssignment(_jobs(1, ('a', 'b')))
     with pytest.raises(ValueError, match='one task'):
-        EpisodeAssignment(_jobs(1, ('a', 'b')))
+        policy.validate_assignment(mixed)
     with pytest.raises(ValueError, match='duplicate'):
         EpisodeAssignment((_jobs(1)[0], ) * 2)
     with pytest.raises(ValueError, match='resume'):
@@ -330,7 +331,7 @@ def test_duplicate_result_and_early_assignment_end_are_rejected():
 def test_scalar_environment_does_not_silently_run_a_batch():
     environment = MockEnvironment()
     environment.setup()
-    with pytest.raises(ValueError, match='sizes differ'):
+    with pytest.raises(ValueError, match='fill all worker slots'):
         execute_assignment(
             environment,
             [MockPolicyClient(), MockPolicyClient()],
