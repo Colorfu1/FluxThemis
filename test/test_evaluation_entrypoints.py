@@ -1,5 +1,6 @@
 """Check the public launcher and recovery path outside package-only tests."""
 
+import importlib
 import json
 import os
 import subprocess
@@ -19,9 +20,14 @@ from fluxthemis.evaluators import SuccessRateEvaluator
 from fluxthemis.model_clients import MockPolicyClient
 from fluxthemis.reporters import MockEvaluationReporter
 from fluxthemis.structures import TaskSpec
-from scripts.evaluation import resume
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture
+def resume(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    return importlib.import_module('evaluation.resume')
 
 
 def _config(capacity):
@@ -84,7 +90,7 @@ def test_launcher_imports_current_checkout(tmp_path, stale_package, dry_run):
 
 @pytest.mark.parametrize('capacity', [1, 2])
 def test_prepare_resume_preserves_scalar_results_and_rejects_batches(
-        tmp_path, capacity):
+        tmp_path, capacity, resume):
     source = tmp_path / 'stopped_run'
     source.mkdir()
     cfg = _config(capacity)
