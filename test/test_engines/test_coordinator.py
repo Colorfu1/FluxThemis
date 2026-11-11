@@ -1,3 +1,4 @@
+from fluxthemis.engines.runners.assignment import EpisodeAssignment
 from fluxthemis.engines.runners.coordinator import (
     DistributedEvaluationCoordinator, _SchedulingState, _WorkerSlot)
 from fluxthemis.engines.runners.episode import build_episode_jobs
@@ -40,7 +41,7 @@ def _coordinator_with_active_job(job):
         generation=0,
         device='0',
         task_manifest=(job.task, ),
-        current_job=job,
+        assignment=EpisodeAssignment((job, )),
         simulator_ready=True,
     )
     coordinator._worker_slots[slot.worker_id] = slot
@@ -84,6 +85,14 @@ def test_rejected_job_requeues_same_slot_with_next_environment_case():
     assert scheduling_state.results_by_episode_id == {}
     assert scheduling_state.started_episode_ids == set()
     assert scheduling_state.next_environment_case_index_by_task == {'task': 3}
+    assert not slot.is_idle
+    coordinator._worker_router.incoming[1] = encode_header(
+        "assignment_end",
+        deployment_id="deployment",
+        worker_id=slot.worker_id,
+        generation=slot.generation,
+        assignment_id=job.episode_id)
+    coordinator._receive_worker_message(evaluation_run)
     assert slot.is_idle
     assert coordinator._worker_router.sent == []
 
@@ -119,7 +128,7 @@ def test_reconnecting_worker_requeues_active_episode():
     assert scheduling_state.pending_jobs.popleft() == job
     assert scheduling_state.restart_counts_by_episode_id == {job.episode_id: 1}
     assert not slot.is_ready
-    assert slot.current_job is None
+    assert slot.assignment is None
     assert slot.routing_id == replacement_routing_id
     assert slot.generation == 1
     assert slot.recovery_deadline is not None

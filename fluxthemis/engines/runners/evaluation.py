@@ -15,6 +15,7 @@ from fluxthemis.evaluators.base import BaseEvaluator
 from fluxthemis.reporters.base import BaseEvaluationReporter
 from fluxthemis.structures import EpisodeResult, TaskSpec
 
+from .assignment import ExecutionPolicy
 from .resume import manifest, read_bundle
 
 
@@ -32,6 +33,7 @@ class EvaluationSettings:
 
     base_seed: int = 7
     episodes_per_task: int = 1
+    episode_batch_size: int = 1
     max_episode_steps: int = 1000
     execute_horizon: int | None = None
     task_ids: Sequence[str] | str | None = None
@@ -65,6 +67,9 @@ class EvaluationSettings:
             raise TypeError('stop_on_success must be a boolean')
         if not isinstance(self.strict_worker_assignment, bool):
             raise TypeError('strict_worker_assignment must be a boolean')
+        ExecutionPolicy(self.episode_batch_size).validate_options(
+            resume=bool(self.resume_path),
+            strict_worker_assignment=self.strict_worker_assignment)
         run_name = self.run_name or _default_run_name()
         _validate_run_name(run_name)
         object.__setattr__(self, 'run_name', run_name)
@@ -371,6 +376,8 @@ def _build_summary(settings: EvaluationSettings, state: _EvaluationState,
             'tasks': [task.task_id for task in state.selected_tasks],
             'episodes_per_task':
             settings.episodes_per_task,
+            'episode_batch_size':
+            settings.episode_batch_size,
             'episodes_per_task_by_task':
             _episodes_per_task_by_task(settings, state.selected_tasks),
             'max_episode_steps':
@@ -398,6 +405,8 @@ def _build_run_start_event(settings: EvaluationSettings,
         settings.base_seed,
         'episodes_per_task':
         settings.episodes_per_task,
+        'episode_batch_size':
+        settings.episode_batch_size,
         'episodes_per_task_by_task':
         _episodes_per_task_by_task(settings, state.selected_tasks),
         'max_episode_steps':

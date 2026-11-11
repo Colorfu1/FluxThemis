@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from fluxthemis.engines.utils import to_jsonable
@@ -18,6 +18,7 @@ from fluxthemis.structures import EpisodeResult, TaskSpec
 from ...transports.zmq_protocol import (decode_frame, decode_header,
                                         empty_payload, encode_frame,
                                         encode_header)
+from .assignment import EpisodeAssignment, ExecutionPolicy
 from .episode import EpisodeJob, build_episode_jobs, select_tasks
 from .evaluation import EvaluationRun, EvaluationStatus, utc_now
 
@@ -31,7 +32,9 @@ class _WorkerSlot:
     generation: int
     device: str
     task_manifest: tuple[TaskSpec, ...] = ()
-    current_job: EpisodeJob | None = None
+    capacity: int = 1
+    assignment: EpisodeAssignment | None = None
+    completed_episode_ids: set[str] = field(default_factory=set)
     episode_deadline: float | None = None
     recovery_deadline: float | None = None
     simulator_ready: bool = False
@@ -43,7 +46,7 @@ class _WorkerSlot:
 
     @property
     def is_idle(self) -> bool:
-        return self.is_ready and self.current_job is None
+        return self.is_ready and self.assignment is None
 
 
 def _next_environment_case_index_by_task(
@@ -120,6 +123,7 @@ class DistributedEvaluationCoordinator:
         self._context = None
         self._stopping = False
         self._strict_worker_assignment = False
+        self._execution_policy = ExecutionPolicy()
 
     def run(self, evaluation_run: EvaluationRun) -> dict[str, Any]:
         import zmq
@@ -186,6 +190,11 @@ class DistributedEvaluationCoordinator:
                   evaluation_run: EvaluationRun) -> dict[str, Any]:
         settings = evaluation_run.settings
         self._strict_worker_assignment = settings.strict_worker_assignment
+        self._execution_policy = ExecutionPolicy(settings.episode_batch_size)
+        for slot in self._worker_slots.values():
+            if slot.capacity != self._execution_policy.batch_size:
+                raise ValueError(
+                    "Worker capacity differs from episode_batch_size")
         selected_tasks = select_tasks(canonical_task_manifest,
                                       settings.task_ids)
         jobs = build_episode_jobs(
@@ -195,6 +204,7 @@ class DistributedEvaluationCoordinator:
             run_session_id=evaluation_run.run_session_id,
             episodes_per_task_overrides=settings.episodes_per_task_overrides,
         )
+        self._execution_policy.validate_jobs(jobs)
         scheduling_state = _SchedulingState.from_jobs(jobs)
         self._scheduling_state = scheduling_state
 
@@ -206,7 +216,9 @@ class DistributedEvaluationCoordinator:
             self._restore_jobs(evaluation_run)
             self._replay_results(evaluation_run)
             self._dispatch_jobs()
-            while not scheduling_state.is_complete:
+            while (not scheduling_state.is_complete
+                   or any(slot.assignment is not None
+                          for slot in self._worker_slots.values())):
                 if self._stopping:
                     raise KeyboardInterrupt
                 now = time.monotonic()
@@ -332,7 +344,18 @@ class DistributedEvaluationCoordinator:
             self._mark_worker_ready(slot, payload)
             return
         scheduling_state = self._require_scheduling_state()
-        if message_type == 'episode_start':
+        if message_type == 'assignment_end':
+            assignment = slot.assignment
+            if (assignment is None or header.get('assignment_id')
+                    != assignment.assignment_id):
+                raise RuntimeError(
+                    'Worker ended an unassigned execution group')
+            expected = {job.episode_id for job in assignment.jobs}
+            if slot.completed_episode_ids != expected:
+                raise RuntimeError(
+                    'Worker ended assignment before all results')
+            self._release_worker_slot(slot)
+        elif message_type == 'episode_start':
             job = self._require_assigned_job(slot, header)
             slot.episode_deadline = self._new_episode_deadline()
             if job.episode_id not in scheduling_state.started_episode_ids:
@@ -350,8 +373,10 @@ class DistributedEvaluationCoordinator:
             # a failed report must not leave an apparently finished job.
             evaluation_run.on_episode_end(result, job.episode_id)
             scheduling_state.results_by_episode_id[job.episode_id] = result
-            self._release_worker_slot(slot)
+            slot.completed_episode_ids.add(job.episode_id)
         elif message_type == 'environment_case_rejected':
+            self._execution_policy.require_recovery(
+                'environment case replacement')
             job = self._require_assigned_job(slot, header)
             next_case_index = (
                 scheduling_state.next_environment_case_index_by_task.get(
@@ -366,7 +391,7 @@ class DistributedEvaluationCoordinator:
             scheduling_state.jobs_by_episode_id[job.episode_id] = retry
             scheduling_state.pending_jobs.appendleft(retry)
             scheduling_state.started_episode_ids.discard(job.episode_id)
-            self._release_worker_slot(slot)
+            slot.completed_episode_ids.add(job.episode_id)
             print(
                 f'[FluxThemis] simulator worker {slot.worker_id} rejected '
                 f'environment case {job.environment_case_index} for '
@@ -412,9 +437,13 @@ class DistributedEvaluationCoordinator:
 
     def _replace_worker_connection(self, slot: _WorkerSlot, *,
                                    routing_id: bytes, generation: int) -> None:
-        job = slot.current_job
-        if job is not None:
-            self._requeue_restarted_job(job)
+        assignment = slot.assignment
+        if assignment is not None:
+            self._execution_policy.require_recovery(
+                'worker restart during an assignment')
+            for job in assignment.jobs:
+                if job.episode_id not in slot.completed_episode_ids:
+                    self._requeue_restarted_job(job)
         elif not slot.simulator_ready:
             slot.startup_restart_count += 1
             if slot.startup_restart_count > self.simulator_restart_limit:
@@ -426,13 +455,16 @@ class DistributedEvaluationCoordinator:
                                       if worker_id != slot.worker_id)
         slot.routing_id = routing_id
         slot.generation = generation
-        slot.current_job = None
+        slot.assignment = None
+        slot.completed_episode_ids.clear()
         slot.episode_deadline = None
         slot.recovery_deadline = time.monotonic() + self.startup_timeout_s
         slot.simulator_ready = False
+        assignment_label = (f' assignment={assignment.assignment_id}'
+                            if assignment else '')
         print(
             f'[FluxThemis] simulator worker {slot.worker_id} reconnecting'
-            f'{f" episode={job.episode_id}" if job else ""}: '
+            f'{assignment_label}: '
             f'generation={generation}',
             file=sys.stderr,
             flush=True,
@@ -465,6 +497,11 @@ class DistributedEvaluationCoordinator:
             raise RuntimeError(
                 f'simulator worker {slot.worker_id!r} changed its task '
                 'manifest after restart')
+        capacity = _positive_int(body.get('capacity', 1), 'worker capacity')
+        if slot.task_manifest and slot.capacity != capacity:
+            raise RuntimeError(
+                'Simulator worker changed capacity after restart')
+        slot.capacity = capacity
         slot.task_manifest = task_manifest
         slot.recovery_deadline = None
         slot.simulator_ready = True
@@ -490,24 +527,30 @@ class DistributedEvaluationCoordinator:
                     continue
                 scheduling_state.pending_jobs.remove(job)
                 self._idle_worker_ids.remove(slot.worker_id)
-                self._assign_job(slot, job)
+                self._assign_jobs(slot, (job, ))
             return
         # Default scheduling still gives the next job to any idle worker.
         while scheduling_state.pending_jobs:
             slot = self._next_idle_worker_slot()
             if slot is None:
                 return
-            job = scheduling_state.pending_jobs.popleft()
-            self._assign_job(slot, job)
+            jobs = tuple(scheduling_state.pending_jobs.popleft()
+                         for _ in range(slot.capacity))
+            self._assign_jobs(slot, jobs)
 
-    def _assign_job(self, slot: _WorkerSlot, job: EpisodeJob) -> None:
-        slot.current_job = job
+    def _assign_jobs(self, slot: _WorkerSlot, jobs: tuple[EpisodeJob,
+                                                          ...]) -> None:
+        assignment = EpisodeAssignment(jobs)
+        if len(jobs) != slot.capacity:
+            raise ValueError('Assignment must fill all worker slots')
+        slot.assignment = assignment
+        slot.completed_episode_ids.clear()
         slot.episode_deadline = self._new_episode_deadline()
         self._send_worker_message(
-            'episode_job',
+            'episode_assignment',
             slot,
-            episode_id=job.episode_id,
-            payload=encode_frame(to_jsonable(job)))
+            assignment_id=assignment.assignment_id,
+            payload=encode_frame({'jobs': [to_jsonable(job) for job in jobs]}))
 
     def _next_idle_worker_slot(self) -> _WorkerSlot | None:
         while self._idle_worker_ids:
@@ -518,7 +561,8 @@ class DistributedEvaluationCoordinator:
         return None
 
     def _release_worker_slot(self, slot: _WorkerSlot) -> None:
-        slot.current_job = None
+        slot.assignment = None
+        slot.completed_episode_ids.clear()
         slot.episode_deadline = None
         self._idle_worker_ids.append(slot.worker_id)
 
@@ -531,8 +575,9 @@ class DistributedEvaluationCoordinator:
         scheduling_state = self._require_scheduling_state()
         episode_id = _required_string(header, 'episode_id')
         job = scheduling_state.jobs_by_episode_id.get(episode_id)
-        if (job is None or slot.current_job is None
-                or slot.current_job != job):
+        if (job is None or slot.assignment is None
+                or job not in slot.assignment.jobs
+                or episode_id in slot.completed_episode_ids):
             raise RuntimeError(
                 f'worker {slot.worker_id} emitted an unassigned episode '
                 f'{episode_id!r}')
@@ -588,9 +633,10 @@ class DistributedEvaluationCoordinator:
 
     def _active_episode_progress(self) -> dict[str, Any] | None:
         jobs = [
-            slot.current_job.episode_start_payload(utc_now())
+            job.episode_start_payload(utc_now())
             for slot in self._worker_slots.values()
-            if slot.current_job is not None
+            if slot.assignment is not None for job in slot.assignment.jobs
+            if job.episode_id not in slot.completed_episode_ids
         ]
         return {'active_episodes': jobs} if jobs else None
 

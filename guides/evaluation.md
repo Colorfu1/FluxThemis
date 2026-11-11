@@ -46,12 +46,45 @@ bash scripts/run_evaluation.sh \
 - `--cfg-options KEY=VALUE ...` 只覆盖 `themis.evaluation` / `themis.transport`。
   模型配置覆盖项应传给模型命令。
 - `--smoke` 对 LIBERO 选择 task 0，对 RoboDojo 选择 `put_bottles_into_dustbin`，
-  对 RoboTwin 选择当前设置的 `adjust_bottle`（all 使用 clean），局数等于 sim 进程数。
+  对 RoboTwin 选择当前设置的 `adjust_bottle`（all 使用 clean），局数等于 sim 进程数
+  乘以 `episode_batch_size`（默认 1）。
   `--full` 选择全部任务，保留 Python 配置的逐任务配额。
 - `--config` 可传多份配置，依次连接已启动的模型。若配置需要不同 checkpoint，
   用户应分别启动对应模型并分次评测，入口不会自动更换权重。
 - `--dry-run` 只解析配置、生成计划和快照，不检查已安装仿真环境，不连接模型或使用 GPU。
   实际启动时会做环境预检；完整验证仍需 smoke。
+
+## 单个模拟器的多个环境
+
+支持原生多环境的适配器可以在一个 worker 内同时推进多个 episode。在 Python
+评测配置中，将 `themis.evaluation.episode_batch_size` 与适配器的 `num_envs`
+设为相同值。`workers-per-gpu` 仍表示模拟器进程数；例如 2 个 worker、每个
+`num_envs=4`，最多同时执行 8 个 episode。模型服务仍独立启动，模型请求按
+episode 分别发送，不要求模型一次推理整个环境 batch。
+
+当前执行模式使用同任务、满批分组，每个任务的实际 episode 配额（包括覆盖值）
+必须能被 `episode_batch_size` 整除。使用 dynamic 调度；fixed 模型 worker
+配对、批量录像和批量恢复暂不支持。批量运行中途失败或拒绝初始 case 时，保留
+已确认的 episode 结果并终止运行，不重试剩余部分。启动阶段仍使用原有的启动
+重试上限；单环境的重试、case 替换、恢复和录像行为保持不变。执行超时覆盖整组。
+
+每个环境分别累计步数、成功状态、Score 和动作片段，结束后立即上报结果；整组
+完成后 worker 才接收下一组。episode ID、seed 和 case index 仍按完整任务列表
+生成，不随 worker 数量或完成顺序变化。
+
+适配器接入要求：
+
+- 继承 `BaseEnvironment`，暴露 `num_envs`，实现 `reset_batch(requests)` 和
+  `step_batch(actions)`；现有单环境适配器可继续只实现 `reset` / `step`。
+- reset 接收按槽位排列的 `EnvironmentReset`，包含任务、episode index、环境
+  seed 和 case index，返回同长度的 `(observation, info)` 序列。
+- step 接收每槽位一个动作，返回同长度的 `StepResult` 序列。已结束的槽位输入和
+  输出均为 `None`，适配器负责冻结或隔离它们，不能影响仍在运行的 episode。
+  不得隐式 auto-reset；终止观测和指标必须属于刚结束的 episode。
+
+这套公共接口不会自动赋予既有 benchmark 原生多环境能力。当前分支提供
+`MockVectorEnvironment` 作为无需 GPU 的接口示例；真实模拟器需在适配器中接入
+其批量 reset、step 和隔离逻辑。单环境和多环境共用同一个 episode 执行循环。
 
 ## 连接与端口
 

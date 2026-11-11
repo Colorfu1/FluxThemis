@@ -67,6 +67,10 @@ def manifest(start):
 
 
 def canonical_jobs(start):
+    from .assignment import ExecutionPolicy
+
+    ExecutionPolicy(start.get('episode_batch_size',
+                              1)).require_recovery('resume')
     task_ids = [task['task_id'] for task in start['tasks']]
     counts = start['episodes_per_task_by_task']
     if (task_ids != start['task_ids'] or not task_ids
