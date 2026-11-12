@@ -15,7 +15,9 @@ from typing import Any, Callable
 
 import numpy as np
 
-from fluxthemis.environments.base import BaseEnvironment, EnvironmentReset
+from fluxthemis.environments.base import (BaseEnvironment,
+                                          EnvironmentCaseRejected,
+                                          EnvironmentReset)
 from fluxthemis.model_clients.base import BasePolicyClient
 from fluxthemis.structures import (ActionChunk, EpisodeResult, StepResult,
                                    TaskSpec)
@@ -268,19 +270,22 @@ class _EpisodeState:
 
 
 def execute_assignment(
-        environment: BaseEnvironment,
-        policy_clients: Sequence[BasePolicyClient],
-        assignment: EpisodeAssignment,
-        max_episode_steps: int,
-        execute_horizon: int | None,
-        stop_on_success: bool,
-        on_episode_started: Callable[[EpisodeJob], None] | None = None,
-        on_episode_finished: (Callable[[EpisodeJob, EpisodeResult], None]
-                              | None) = None,
-        save_videos: bool = False,
-        video_dir: str | os.PathLike | None = None,
-        video_fps: int = 20,
-        video_worker_id: str | None = None) -> tuple[EpisodeResult, ...]:
+    environment: BaseEnvironment,
+    policy_clients: Sequence[BasePolicyClient],
+    assignment: EpisodeAssignment,
+    max_episode_steps: int,
+    execute_horizon: int | None,
+    stop_on_success: bool,
+    on_episode_started: Callable[[EpisodeJob], None] | None = None,
+    on_episode_finished: (Callable[[EpisodeJob, EpisodeResult], None]
+                          | None) = None,
+    save_videos: bool = False,
+    video_dir: str | os.PathLike | None = None,
+    video_fps: int = 20,
+    video_worker_id: str | None = None,
+    on_case_rejected: Callable[[EpisodeJob, Mapping[str, Any]], None]
+    | None = None
+) -> tuple[EpisodeResult, ...]:
     """Advance one assignment with independent per-slot episode state.
 
     Policy requests remain per episode; this is simulator batching, not a
@@ -348,10 +353,22 @@ def execute_assignment(
             if len(transitions) != len(states):
                 raise ValueError(
                     'step_batch returned the wrong number of slots')
-            for state, transition in zip(states, transitions):
+            for slot, (state,
+                       transition) in enumerate(zip(states, transitions)):
                 if state is None or state.result is not None:
                     if transition is not None:
                         raise ValueError('Inactive slots must return None')
+                    continue
+                if transition.case_rejected:
+                    if on_case_rejected is None:
+                        raise EnvironmentCaseRejected(
+                            'Environment invalidated an active case',
+                            slots=[slot])
+                    on_case_rejected(state.job, transition.info)
+                    if recorder is not None:
+                        recorder.abort()
+                        recorder = None
+                    states[slot] = None
                     continue
                 state.advance(transition, max_episode_steps, stop_on_success)
                 if recorder is not None:

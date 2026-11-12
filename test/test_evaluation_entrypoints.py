@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,47 @@ from fluxthemis.reporters import MockEvaluationReporter
 from fluxthemis.structures import TaskSpec
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_recovery_retains_explicit_runtime_case_replacement(tmp_path):
+    from fluxthemis.engines.runners.resume import (build_bundle,
+                                                   validate_journal)
+
+    reporter = MockEvaluationReporter()
+    tasks = [TaskSpec('task')]
+    job = build_episode_jobs(tasks, 1, 7, reporter.run_session_id)[0]
+    replacement = replace(job, environment_case_index=1)
+    with EvaluationRun(EvaluationSettings(), SuccessRateEvaluator(),
+                       reporter) as run:
+        run.start(tasks, 1)
+        run.on_episode_start(job.episode_start_payload(utc_now()))
+        payload = replacement.episode_start_payload(utc_now())
+        payload['replaces_environment_case_index'] = 0
+        run.on_episode_start(payload)
+        environment = MockEnvironment(success_after=1)
+        environment.setup()
+        result = execute_episode(environment, MockPolicyClient(), replacement,
+                                 5, None, True)
+        run.on_episode_end(result, replacement.episode_id)
+        run.finish(result)
+    rows = [
+        dict(
+            event_type=kind,
+            payload=body,
+            sequence=index,
+            run_session_id=reporter.run_session_id,
+            recorded_at=utc_now())
+        for index, (kind, body) in enumerate(reporter.events, 1)
+    ]
+    journal = tmp_path / 'events.jsonl'
+    journal.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    bundle = build_bundle(tmp_path)
+    assert len(bundle['completed']) == 1
+    assert bundle['completed'][0]['start']['environment_case_index'] == 1
+    assert bundle['jobs'][0]['environment_case_index'] == 1
+    rows[2]['payload'].pop('replaces_environment_case_index')
+    with pytest.raises(ValueError, match='Duplicate episode_start'):
+        validate_journal(rows)
 
 
 @pytest.fixture

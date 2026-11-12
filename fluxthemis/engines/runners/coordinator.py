@@ -75,6 +75,7 @@ class _SchedulingState:
     rejection_counts_by_episode_id: dict[str,
                                          int] = field(default_factory=dict)
     restored_started_episode_ids: set[str] = field(default_factory=set)
+    replaced_cases_by_episode_id: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_jobs(cls, jobs: tuple[EpisodeJob, ...]) -> _SchedulingState:
@@ -373,8 +374,14 @@ class DistributedEvaluationCoordinator:
             job = self._require_assigned_job(slot, header)
             if job.episode_id not in scheduling_state.started_episode_ids:
                 episode_start_payload = job.episode_start_payload(utc_now())
+                replacements = scheduling_state.replaced_cases_by_episode_id
+                previous_case = replacements.get(job.episode_id)
+                if previous_case is not None:
+                    episode_start_payload[
+                        'replaces_environment_case_index'] = previous_case
                 evaluation_run.on_episode_start(episode_start_payload)
                 scheduling_state.started_episode_ids.add(job.episode_id)
+                replacements.pop(job.episode_id, None)
         elif message_type == 'episode_end':
             job = self._require_assigned_job(
                 slot, header, allow_completed=True)
@@ -406,8 +413,14 @@ class DistributedEvaluationCoordinator:
             replace_case = header.get('replace_case', True)
             if type(replace_case) is not bool:
                 raise ValueError('replace_case must be a boolean')
+            invalidated = header.get('invalidated', False)
+            if type(invalidated) is not bool:
+                raise ValueError('invalidated must be a boolean')
+            if invalidated and (not was_started or not replace_case):
+                raise ValueError(
+                    'Invalid case invalidation before episode start')
             retry = job
-            if was_started and replace_case:
+            if was_started and replace_case and not invalidated:
                 # A previously acknowledged start fixes the initial condition.
                 # A reset failure during recovery retries it within the same
                 # infrastructure budget, without choosing a different layout.
@@ -433,6 +446,13 @@ class DistributedEvaluationCoordinator:
                 scheduling_state.next_environment_case_index_by_task[
                     job.task.task_id] = next_case_index + 1
                 retry = replace(job, environment_case_index=next_case_index)
+                if invalidated:
+                    scheduling_state.replaced_cases_by_episode_id[
+                        job.episode_id] = job.environment_case_index
+                    scheduling_state.started_episode_ids.discard(
+                        job.episode_id)
+                    scheduling_state.restored_started_episode_ids.discard(
+                        job.episode_id)
                 print(
                     f'[FluxThemis] simulator worker {slot.worker_id} '
                     'rejected '
@@ -443,7 +463,7 @@ class DistributedEvaluationCoordinator:
                     flush=True,
                 )
             scheduling_state.jobs_by_episode_id[job.episode_id] = retry
-            if not (was_started and replace_case):
+            if invalidated or not (was_started and replace_case):
                 scheduling_state.pending_jobs.append(retry)
             slot.completed_episode_ids.add(job.episode_id)
         else:
@@ -618,8 +638,13 @@ class DistributedEvaluationCoordinator:
                 return
             first = scheduling_state.pending_jobs.popleft()
             jobs = [first]
-            while (len(jobs) < slot.capacity and scheduling_state.pending_jobs
-                   and scheduling_state.pending_jobs[0].task == first.task):
+            retries = scheduling_state.restart_counts_by_episode_id
+            while (not retries.get(first.episode_id)
+                   and len(jobs) < slot.capacity
+                   and scheduling_state.pending_jobs
+                   and scheduling_state.pending_jobs[0].task == first.task
+                   and not retries.get(
+                       scheduling_state.pending_jobs[0].episode_id)):
                 jobs.append(scheduling_state.pending_jobs.popleft())
             self._assign_jobs(slot, tuple(jobs))
 

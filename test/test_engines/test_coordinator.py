@@ -183,3 +183,50 @@ def test_case_reset_failure_after_start_retries_same_layout():
     slot.completed_episode_ids.clear()
     with pytest.raises(RuntimeError, match='restart limit'):
         coordinator._receive_worker_message(run)
+
+
+def test_native_invalid_sample_can_replace_started_case_without_restart():
+    jobs = build_episode_jobs([TaskSpec('task')], 2, 7, 'run')
+    coordinator, slot, run = _coordinator_with_active_job(jobs[0])
+    state = coordinator._scheduling_state = _SchedulingState.from_jobs(jobs)
+    state.pending_jobs.clear()
+    state.started_episode_ids.add(jobs[0].episode_id)
+    state.restored_started_episode_ids.add(jobs[0].episode_id)
+    starts = []
+    run.on_episode_start = starts.append
+    coordinator._worker_router.incoming[1] = encode_header(
+        'environment_case_rejected',
+        deployment_id='deployment',
+        worker_id=slot.worker_id,
+        generation=0,
+        episode_id=jobs[0].episode_id,
+        assignment_id=slot.assignment.assignment_id,
+        replace_case=True,
+        invalidated=True)
+    coordinator._receive_worker_message(run)
+    retry = state.pending_jobs[0]
+    assert retry.environment_case_index == 2
+    assert retry.policy_seed == jobs[0].policy_seed
+    assert retry.episode_id == jobs[0].episode_id
+    assert state.restart_counts_by_episode_id == {}
+    assert state.rejection_counts_by_episode_id == {retry.episode_id: 1}
+    assert not state.started_episode_ids
+    assert not state.restored_started_episode_ids
+    coordinator._worker_router.incoming[1] = encode_header(
+        'assignment_end',
+        deployment_id='deployment',
+        worker_id=slot.worker_id,
+        generation=0,
+        assignment_id=slot.assignment.assignment_id)
+    coordinator._receive_worker_message(run)
+    coordinator._dispatch_jobs()
+    coordinator._worker_router.incoming[1] = encode_header(
+        'episode_start',
+        deployment_id='deployment',
+        worker_id=slot.worker_id,
+        generation=0,
+        assignment_id=slot.assignment.assignment_id,
+        episode_id=retry.episode_id)
+    coordinator._receive_worker_message(run)
+    assert starts[0]['replaces_environment_case_index'] == 0
+    assert starts[0]['environment_case_index'] == 2

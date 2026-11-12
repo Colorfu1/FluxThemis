@@ -676,6 +676,16 @@ class RoboDojoEnvironment(BaseEnvironment):
         action_dict = self._action_to_dict(action)
         try:
             self._env.take_action(action_dict)
+            if 0 in getattr(self._env, 'unstable_envs', ()):
+                self._env.end_flag[0] = True
+                self._video_finalized = True
+                return StepResult(
+                    observation={},
+                    case_rejected=True,
+                    info={
+                        'environment_case_index': self._episode_layout_index,
+                        'reason': 'RoboDojo marked this sample unstable'
+                    })
             observation = robodojo_obs_to_flat(self._env.get_obs())
         except Exception as exc:
             if not _is_recoverable_robodojo_case_error(exc):
@@ -793,14 +803,6 @@ class RoboDojoEnvironment(BaseEnvironment):
                 f'RoboDojo initial layouts rejected in slots {rejected}',
                 slots=rejected)
 
-    def _check_batch_stability(self) -> None:
-        unstable = set(getattr(self._env, 'unstable_envs',
-                               ())) - self._batch_inactive
-        if unstable:
-            raise RuntimeError(
-                f'RoboDojo batch contains unstable slots: {sorted(unstable)}; '
-                'cannot continue this simulator assignment')
-
     def step_batch(
             self,
             actions: Sequence[Any | None]) -> Sequence[StepResult | None]:
@@ -825,14 +827,34 @@ class RoboDojoEnvironment(BaseEnvironment):
         # Only active lanes receive control/reward updates. Native scenes have
         # separate objects and robots, so finished lanes cannot affect peers.
         self._env.take_action_batch(action_dicts, env_idx_list=active)
-        self._check_batch_stability()
-        observations = self._env.get_obs_batch(env_idx_list=active)
-        self._check_batch_stability()
-        if len(observations) != len(active):
+        unstable = set(getattr(self._env, 'unstable_envs', ()))
+        observed = [slot for slot in active if slot not in unstable]
+        observations = (
+            self._env.get_obs_batch(env_idx_list=observed) if observed else [])
+        if len(observations) != len(observed):
             raise RuntimeError(
                 'RoboDojo returned an incomplete observation batch')
-        for slot, observation in zip(active, observations):
+        by_slot = dict(zip(observed, observations))
+        unstable.update(getattr(self._env, 'unstable_envs', ()))
+        for slot in active:
             request = self._batch_requests[slot]
+            if slot in unstable:
+                # Native run_eval excludes these samples from its denominator
+                # (for example make_kong's scripted opponent discard failed).
+                # Freeze only this lane; healthy lanes keep their trajectory.
+                self._batch_inactive.add(slot)
+                self._env.end_flag[slot] = True
+                results[slot] = StepResult(
+                    observation={},
+                    case_rejected=True,
+                    info={
+                        'environment_case_index':
+                        request.environment_case_index,
+                        'environment_slot': slot,
+                        'reason': 'RoboDojo marked this sample unstable'
+                    })
+                continue
+            observation = by_slot[slot]
             terminated = bool(self._env.end_flag[slot])
             success = bool(self._env.success[slot]) if terminated else None
             score = self._current_score(success, slot)

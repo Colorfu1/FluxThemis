@@ -335,6 +335,19 @@ class _SimulatorWorker:
                     assignment_id=assignment.assignment_id,
                     payload=encode_frame(to_jsonable(result)))
 
+            def report_case_rejected(job: EpisodeJob,
+                                     info: Mapping[str, Any]) -> None:
+                _send_episode_event(
+                    socket,
+                    self._message_identity,
+                    'environment_case_rejected',
+                    job.episode_id,
+                    assignment_id=assignment.assignment_id,
+                    replace_case=True,
+                    invalidated=True,
+                    message=str(
+                        info.get('reason', 'Invalid benchmark sample')))
+
             try:
                 execute_assignment(
                     environment=environment,
@@ -346,6 +359,7 @@ class _SimulatorWorker:
                         evaluation_cfg.get('stop_on_success', True)),
                     on_episode_started=report_episode_start,
                     on_episode_finished=report_episode_end,
+                    on_case_rejected=report_case_rejected,
                     save_videos=save_videos,
                     video_dir=video_dir,
                     video_fps=video_fps,

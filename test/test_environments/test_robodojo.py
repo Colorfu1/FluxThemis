@@ -168,6 +168,29 @@ def test_robodojo_inactive_lane_cannot_reject_tail_batch(batch_environment):
     assert env.step_batch([1, None, None])[1:] == [None, None]
 
 
+def test_runtime_invalid_layout_freezes_only_its_lane(batch_environment,
+                                                      monkeypatch):
+    env, native, requests = batch_environment
+    env.reset_batch(requests)
+    take_action = native.take_action_batch
+
+    def invalidate(actions, env_idx_list):
+        take_action(actions, env_idx_list)
+        native.unstable_envs.add(1)
+
+    monkeypatch.setattr(native, 'take_action_batch', invalidate)
+    transitions = env.step_batch([1, 2, 3])
+    assert transitions[0].success
+    assert transitions[1].case_rejected
+    assert transitions[1].success is None
+    assert transitions[2].observation == {'slot': 2}
+    assert not transitions[2].case_rejected
+    transitions = env.step_batch([None, None, 4])
+    assert transitions[:2] == [None, None]
+    assert native.take_action_cnt == [1, 1, 2]
+    assert native.action_calls[-1][1] == [2]
+
+
 def test_partial_native_reset_failure_identifies_slot_and_cleans_up(
         batch_environment, monkeypatch):
     env, native, requests = batch_environment

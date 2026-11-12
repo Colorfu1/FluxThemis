@@ -126,6 +126,39 @@ def test_partial_results_survive_later_slot_failure():
     assert environment.environments[0].step_count == 1
 
 
+def test_runtime_invalid_case_does_not_drop_healthy_progress():
+
+    class InvalidCase(MockVectorEnvironment):
+
+        def step_batch(self, actions):
+            transitions = super().step_batch(actions)
+            if actions[0] is not None:
+                transitions[0].case_rejected = True
+            return transitions
+
+    environment = InvalidCase(2, success_after=3)
+    environment.setup()
+    jobs = _jobs(2)
+    clients = [MockPolicyClient(chunk_size=1) for _ in range(2)]
+    rejected, completed = [], []
+    results = execute_assignment(
+        environment,
+        clients,
+        EpisodeAssignment(jobs),
+        10,
+        None,
+        True,
+        on_case_rejected=lambda job, info: rejected.append(job.episode_id),
+        on_episode_finished=lambda job, result: completed.append(job.episode_id
+                                                                 ))
+    assert rejected == [jobs[0].episode_id]
+    assert completed == [jobs[1].episode_id]
+    assert [result.episode_index for result in results] == [1]
+    assert results[0].success and results[0].steps == 3
+    assert [client.call_count for client in clients] == [1, 3]
+    assert environment.environments[0].step_count == 1
+
+
 @pytest.mark.parametrize('capacity', [1, 2])
 def test_nonfinite_score_is_rejected(capacity):
 
@@ -288,6 +321,23 @@ def test_batch_reconnect_only_requeues_unfinished_episodes():
     assert coordinator._scheduling_state.results_by_episode_id == {
         jobs[0].episode_id: 'saved'
     }
+
+
+def test_process_recovery_does_not_regroup_affected_episodes():
+    jobs = _jobs(4)
+    coordinator, slot = _coordinator(3, jobs)
+    coordinator._dispatch_jobs()
+    coordinator._replace_worker_connection(
+        slot, routing_id=b'replacement', generation=1)
+    recovered = []
+    for _ in range(3):
+        slot.simulator_ready = True
+        slot.recovery_deadline = None
+        coordinator._idle_worker_ids.append(slot.worker_id)
+        coordinator._dispatch_jobs()
+        recovered.append(slot.assignment.jobs)
+        slot.assignment = None
+    assert recovered == [(jobs[0], ), (jobs[1], ), (jobs[2], )]
 
 
 def test_scalar_retry_budget_is_per_episode_not_worker_generation():
