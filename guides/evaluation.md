@@ -46,12 +46,65 @@ bash scripts/run_evaluation.sh \
 - `--cfg-options KEY=VALUE ...` 只覆盖 `themis.evaluation` / `themis.transport`。
   模型配置覆盖项应传给模型命令。
 - `--smoke` 对 LIBERO 选择 task 0，对 RoboDojo 选择 `put_bottles_into_dustbin`，
-  对 RoboTwin 选择当前设置的 `adjust_bottle`（all 使用 clean），局数等于 sim 进程数。
+  对 RoboTwin 选择当前设置的 `adjust_bottle`（all 使用 clean），局数等于 sim 进程数
+  乘以 `episode_batch_size`（默认 1）。
   `--full` 选择全部任务，保留 Python 配置的逐任务配额。
 - `--config` 可传多份配置，依次连接已启动的模型。若配置需要不同 checkpoint，
   用户应分别启动对应模型并分次评测，入口不会自动更换权重。
 - `--dry-run` 只解析配置、生成计划和快照，不检查已安装仿真环境，不连接模型或使用 GPU。
   实际启动时会做环境预检；完整验证仍需 smoke。
+
+## 单个模拟器的多个环境
+
+支持原生多环境的适配器可以在一个 worker 内同时推进多个 episode。在 Python
+评测配置中，将 `themis.evaluation.episode_batch_size` 与适配器的 `num_envs`
+设为相同值。`workers-per-gpu` 仍表示模拟器进程数；例如 2 个 worker、每个
+`num_envs=4`，最多同时执行 8 个 episode。模型服务仍独立启动，模型请求按
+episode 分别发送，不要求模型一次推理整个环境 batch。
+
+每次分配最多包含 `episode_batch_size` 个 episode，允许尾批。环境通过 ready
+消息中的 `requires_single_task` 声明是否要求同任务组批；RoboDojo 声明此约束。
+例如一个 RoboDojo 任务配额为 25、容量为 10 时，分成 10、10、5；空槽位不启动
+episode，也不执行推理。dynamic 和 fixed 调度都按容量分配；fixed 只从该 worker
+固定配对的 episode 中取 job，重试 job 也可以组批。
+
+`episode_timeout_s` 限制整组 assignment 的总运行时间，包括 reset、模型推理、
+环境执行和录像收尾。增加 slot 数不会增加超时预算，完成一个 slot 也不会延长
+剩余 slot 的期限。选择容量时应为整组的串行模型请求预留时间。
+
+每次分配有独立的执行编号，旧进程或旧分配的迟到消息不影响新分配。同一次分配的
+重复结果只计一次；结果内容冲突会报错。结果先被 reporter 确认，才计入完成数。
+每个 slot 分别累计步数、成功状态、Score 和动作片段，结束后立即上报并收尾录像；
+整组结束后 worker 才接收下一组。episode ID 和 seed 按完整任务列表生成，
+不随 worker 数量或完成顺序变化。策略返回 `PolicyStop` 时只结束对应 slot，
+其余 slot 继续执行。策略自行声明完成的记录与环境判定的成功结果分别保存。
+
+reset 阶段拒绝初始 case 时，coordinator 为该 slot 分配未使用的 layout；step
+阶段拒绝时，重试相同 layout，受 `--simulator-restart-limit` 约束。健康 slot
+继续运行，被拒 slot 的录像单独丢弃。正常失败和达到步数上限仍是完成的评测结果。
+现有 `--resume` 流程可以重放已确认的结果，再执行剩余 episode。
+
+适配器接入要求：
+
+- `BaseEnvironment` 只要求 `num_envs`、`reset_batch(requests)`、
+  `step_batch(actions)` 和 `finalize_episode(slot, ...)`；slot 必须显式传入。
+  只实现 scalar reset/step 的旧环境继承 `SingleEnvironmentAdapter`，由它转换为
+  长度为 1 的 batch。LIBERO、RoboTwin、RoboCasa、Gymnasium 和 mock 已接入。
+- reset 输入是长度为 `num_envs` 的列表，活动 slot 是 `EnvironmentResetRequest`，
+  包含任务、episode index、环境 seed 和 case index。输出按 slot 返回
+  `EnvironmentReset`，包含 observation、info 和 rejected；空 slot 的输入和输出
+  都是 `None`。
+- step 输入每 slot 一个动作，输出同长度的 `StepResult` 列表。使用
+  `case_rejected` 标记拒绝；空闲或已结束 slot 的输入和输出都是 `None`。适配器
+  负责冻结或隔离它们，不能影响健康 episode，也不得隐式 auto-reset。
+- 唯一执行入口是 `execute_assignment`。返回列表保留 slot 位置，被拒或未使用的
+  slot 为 `None`，其余为 `EpisodeResult`。
+- 每个 slot 单独结束或丢弃录像。通用录制器调用 `render(slot)`；原生录制器在
+  `finalize_episode(slot, ...)` 中收尾，并按 `case_rejected` 终止原因丢弃录像。
+
+RoboDojo 在单 env 和多 env 下都通过原生 `reset`、`get_obs_batch` 和
+`take_action_batch` 执行，在一个 Isaac Sim 进程中加载独立 layout，通过 None
+seed 禁用尾批空 slot。`MockVectorEnvironment` 提供 CPU 示例。
 
 ## 连接与端口
 

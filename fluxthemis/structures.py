@@ -47,6 +47,9 @@ class StepResult:
     success: bool | None = None
     info: Mapping[str, Any] = field(default_factory=dict)
     score: float | None = None
+    # Omit this sample from episode results. The runner reports a step
+    # rejection so the coordinator retries the same layout.
+    case_rejected: bool = False
 
 
 @dataclass
