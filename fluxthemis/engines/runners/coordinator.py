@@ -38,6 +38,7 @@ class _WorkerSlot:
     episode_deadline: float | None = None
     recovery_deadline: float | None = None
     simulator_ready: bool = False
+    restart_pending: bool = False
     startup_restart_count: int = 0
 
     @property
@@ -50,7 +51,8 @@ class _WorkerSlot:
 
     @property
     def is_ready(self) -> bool:
-        return self.simulator_ready and bool(self.task_manifest)
+        return (self.simulator_ready and not self.restart_pending
+                and bool(self.task_manifest))
 
     @property
     def is_idle(self) -> bool:
@@ -78,6 +80,9 @@ class _SchedulingState:
     started_episode_ids: set[str]
     next_environment_case_index_by_task: dict[str, int]
     restart_counts_by_episode_id: dict[str, int]
+    rejection_counts_by_episode_id: dict[str,
+                                         int] = field(default_factory=dict)
+    restored_started_episode_ids: set[str] = field(default_factory=set)
     replaced_cases_by_episode_id: dict[str, int] = field(default_factory=dict)
 
     @classmethod
@@ -220,6 +225,7 @@ class DistributedEvaluationCoordinator:
             self._dispatch_jobs()
             while (not scheduling_state.is_complete
                    or any(slot.assignment is not None
+                          or slot.recovery_deadline is not None
                           for slot in self._worker_slots.values())):
                 if self._stopping:
                     raise KeyboardInterrupt
@@ -274,6 +280,8 @@ class DistributedEvaluationCoordinator:
         # Keep the new session's job IDs and canonical seeds. Only layout
         # choices come from recovery, including replacements of rejected cases.
         for key, job in list(state.jobs_by_episode_id.items()):
+            if saved[job.global_episode_number].get('started', False):
+                state.restored_started_episode_ids.add(key)
             state.jobs_by_episode_id[key] = replace(
                 job,
                 environment_case_index=saved[job.global_episode_number]
@@ -336,6 +344,9 @@ class DistributedEvaluationCoordinator:
         self._validate_deployment(header)
         payload = frames[2] if len(frames) > 2 else empty_payload()
         message_type = header['type']
+        if message_type == 'worker_exit':
+            self._handle_worker_exit(routing_id, header)
+            return
         if message_type == 'register_worker':
             self._register_worker(routing_id, header)
             return
@@ -400,6 +411,15 @@ class DistributedEvaluationCoordinator:
             phase = header.get('phase')
             if phase not in ('reset', 'step'):
                 raise ValueError('Case rejection phase must be reset or step')
+            count = scheduling_state.rejection_counts_by_episode_id.get(
+                job.episode_id, 0) + 1
+            limit = evaluation_run.settings.environment_case_rejection_limit
+            if count > limit:
+                raise RuntimeError(
+                    f'Episode {job.episode_id!r} exceeded environment '
+                    f'case rejection limit {limit}')
+            scheduling_state.rejection_counts_by_episode_id[
+                job.episode_id] = count
             next_case_index = (
                 scheduling_state.next_environment_case_index_by_task.get(
                     job.task.task_id))
@@ -411,9 +431,13 @@ class DistributedEvaluationCoordinator:
                 job.task.task_id] = next_case_index + 1
             retry = replace(job, environment_case_index=next_case_index)
             scheduling_state.jobs_by_episode_id[job.episode_id] = retry
-            if job.episode_id in scheduling_state.started_episode_ids:
+            if (job.episode_id in scheduling_state.started_episode_ids
+                    or job.episode_id
+                    in scheduling_state.restored_started_episode_ids):
                 scheduling_state.replaced_cases_by_episode_id[
                     job.episode_id] = job.environment_case_index
+            scheduling_state.restored_started_episode_ids.discard(
+                job.episode_id)
             scheduling_state.started_episode_ids.discard(job.episode_id)
             scheduling_state.pending_jobs.appendleft(retry)
             print(
@@ -438,6 +462,8 @@ class DistributedEvaluationCoordinator:
             if generation < slot.generation:
                 return
             if generation == slot.generation:
+                if slot.restart_pending:
+                    return
                 raise RuntimeError(
                     f'duplicate simulator worker generation {worker_id!r} '
                     f'generation={generation}')
@@ -460,8 +486,36 @@ class DistributedEvaluationCoordinator:
             device=device,
         )
 
-    def _replace_worker_connection(self, slot: _WorkerSlot, *,
-                                   routing_id: bytes, generation: int) -> None:
+    def _handle_worker_exit(self, routing_id: bytes,
+                            header: Mapping[str, Any]) -> None:
+        """Decide recovery before a supervisor starts a replacement process."""
+        worker_id = _required_string(header, 'worker_id')
+        generation = _required_nonnegative_int(header, 'generation')
+        slot = self._worker_slots.get(worker_id)
+        if slot is None:
+            # A child can fail before its first registration reaches us.
+            self._register_worker(routing_id, header)
+            slot = self._worker_slots[worker_id]
+        if generation < slot.generation:
+            return
+        if (generation != slot.generation or slot.restart_pending
+                or header.get('device') != slot.device):
+            raise RuntimeError('Invalid simulator exit notification')
+        # Route the eventual shutdown to the waiting supervisor, including
+        # when recovery is rejected. run.fail() persists results first.
+        slot.routing_id = routing_id
+        slot.restart_pending = True
+        self._recover_worker(slot)
+        slot.assignment = None
+        slot.completed_episode_ids.clear()
+        slot.episode_deadline = None
+        slot.simulator_ready = False
+        slot.recovery_deadline = time.monotonic() + self.startup_timeout_s
+        self._idle_worker_ids = deque(value for value in self._idle_worker_ids
+                                      if value != worker_id)
+        self._send_worker_message('restart_worker', slot)
+
+    def _recover_worker(self, slot: _WorkerSlot) -> None:
         assignment = slot.assignment
         if assignment is not None:
             for job in reversed(assignment.jobs):
@@ -474,6 +528,12 @@ class DistributedEvaluationCoordinator:
                     f'simulator worker {slot.worker_id!r} exceeded startup '
                     f'restart limit {self.simulator_restart_limit}')
 
+    def _replace_worker_connection(self, slot: _WorkerSlot, *,
+                                   routing_id: bytes, generation: int) -> None:
+        assignment = slot.assignment
+        if not slot.restart_pending:
+            self._recover_worker(slot)
+        slot.restart_pending = False
         self._idle_worker_ids = deque(worker_id
                                       for worker_id in self._idle_worker_ids
                                       if worker_id != slot.worker_id)
@@ -626,7 +686,7 @@ class DistributedEvaluationCoordinator:
         if slot is None:
             raise RuntimeError(
                 'simulator worker must register before sending data')
-        if generation < slot.generation:
+        if generation < slot.generation or slot.restart_pending:
             return None
         if generation != slot.generation or routing_id != slot.routing_id:
             raise RuntimeError('simulator worker connection mismatch')

@@ -82,10 +82,16 @@ episode，也不执行推理。dynamic 和 fixed 调度都按容量分配；fixe
 
 reset 或 step 阶段拒绝 case 时，coordinator 都为该 slot 分配未使用的 layout，
 优先补足被拒的 episode。被拒样本不计入成功、失败、Score 或 episode 耗时，
-不消耗 `--simulator-restart-limit` 的进程重启预算，也没有额外的拒绝次数上限。
+不消耗 `--simulator-restart-limit` 的进程重启预算。
 phase 只用于日志。健康 slot 继续运行，被拒 slot 的录像单独丢弃。
 正常失败和达到步数上限仍是完成的评测结果。
 现有 `--resume` 流程可以重放已确认的结果，再执行剩余 episode。
+
+恢复日志保存已开始 episode 的实际 layout，包括 case 替换记录。`--resume` 保留
+这些初始状态以及 episode ID 和 seed。模拟器退出后，supervisor 先等待 coordinator
+确认未完成 job 的重试预算，再启动替代进程；已确认结果不重跑。
+`themis.evaluation.environment_case_rejection_limit` 限制每个 episode 的 reset/step
+拒绝总次数，默认 100，与模拟器重试预算分别计算。
 
 适配器接入要求：
 

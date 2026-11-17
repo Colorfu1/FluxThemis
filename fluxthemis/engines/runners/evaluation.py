@@ -32,6 +32,7 @@ class EvaluationSettings:
 
     base_seed: int = 7
     episodes_per_task: int = 1
+    environment_case_rejection_limit: int = 100
     max_episode_steps: int = 1000
     execute_horizon: int | None = None
     task_ids: Sequence[str] | str | None = None
@@ -55,6 +56,10 @@ class EvaluationSettings:
         object.__setattr__(
             self, 'max_episode_steps',
             _positive_integer(self.max_episode_steps, 'max_episode_steps'))
+        object.__setattr__(
+            self, 'environment_case_rejection_limit',
+            _positive_integer(self.environment_case_rejection_limit,
+                              'environment_case_rejection_limit'))
         if self.execute_horizon is not None:
             object.__setattr__(
                 self, 'execute_horizon',
@@ -371,6 +376,8 @@ def _build_summary(settings: EvaluationSettings, state: _EvaluationState,
             'tasks': [task.task_id for task in state.selected_tasks],
             'episodes_per_task':
             settings.episodes_per_task,
+            'environment_case_rejection_limit':
+            settings.environment_case_rejection_limit,
             'episodes_per_task_by_task':
             _episodes_per_task_by_task(settings, state.selected_tasks),
             'max_episode_steps':
@@ -398,6 +405,8 @@ def _build_run_start_event(settings: EvaluationSettings,
         settings.base_seed,
         'episodes_per_task':
         settings.episodes_per_task,
+        'environment_case_rejection_limit':
+        settings.environment_case_rejection_limit,
         'episodes_per_task_by_task':
         _episodes_per_task_by_task(settings, state.selected_tasks),
         'max_episode_steps':
