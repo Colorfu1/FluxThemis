@@ -216,7 +216,7 @@ def load_config(path, *, mode=None, overrides=None):
             raise ValueError(
                 'Set a smoke task explicitly for this environment')
         task = smoke_tasks[kind]
-        episodes = total_workers
+        episodes = total_workers * evaluation.get('episode_batch_size', 1)
     elif mode == 'full':
         task, episodes = 'all', None
     if task is not None:
