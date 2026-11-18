@@ -54,6 +54,10 @@ class BaseEnvironment(ABC):
         """Return the tasks available for evaluation."""
         raise NotImplementedError
 
+    def task_capacity(self, task: TaskSpec) -> int:
+        """Return this task's assignment capacity after setup."""
+        return self.num_envs
+
     @abstractmethod
     def reset_batch(
         self, requests: list[EnvironmentResetRequest | None]

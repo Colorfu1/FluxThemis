@@ -327,15 +327,21 @@ def test_capacity_and_declared_task_capability_validation():
     with pytest.raises(ValueError, match='own policy client'):
         policy.validate_assignment(mixed, [MockPolicyClient()] * 2)
     with pytest.raises(ValueError, match='capacity changed'):
-        policy.validate_capacity(3)
+        policy.validate_capacity(3, {})
     with pytest.raises(TypeError, match='requires_single_task'):
         ExecutionPolicy(2, requires_single_task='yes')
 
 
 def test_assignment_respects_task_limit_with_full_worker_client_container():
-    task = TaskSpec('limited', metadata={'max_slots': 5})
+    task = TaskSpec('limited')
     jobs = build_episode_jobs([task], 8, 7, 'run')
-    policy = ExecutionPolicy(8, requires_single_task=True)
+    policy = ExecutionPolicy(
+        8,
+        requires_single_task=True,
+        task_capacities={
+            'limited': 5,
+            'full': 8
+        })
     clients = [MockPolicyClient() for _ in range(8)]
     policy.validate_assignment(EpisodeAssignment(jobs[:5]), clients)
     with pytest.raises(ValueError, match='task slot limit'):
@@ -343,17 +349,41 @@ def test_assignment_respects_task_limit_with_full_worker_client_container():
     with pytest.raises(ValueError, match='sizes differ'):
         policy.validate_assignment(EpisodeAssignment(jobs[:5]), clients[:5])
     assert policy.task_capacity(TaskSpec('unlimited')) == 8
-    assert policy.task_capacity(
-        TaskSpec('larger', metadata={'max_slots': 12})) == 8
+    assert policy.task_capacity(TaskSpec('full')) == 8
+    policy.validate_capacity(8, {'limited': 5, 'full': 8})
 
 
 @pytest.mark.parametrize('limit', [0, -1, True, 1.5, None])
 def test_task_slot_limit_validation(limit):
-    jobs = build_episode_jobs(
-        [TaskSpec('task', metadata={'max_slots': limit})], 1, 7, 'run')
     with pytest.raises(
-            ValueError, match='max_slots must be a positive integer'):
-        ExecutionPolicy(8).validate_assignment(EpisodeAssignment(jobs))
+            ValueError, match='task capacity must be a positive integer'):
+        ExecutionPolicy(8, task_capacities={'task': limit})
+
+
+def test_task_capacity_cannot_exceed_worker_capacity():
+    with pytest.raises(
+            ValueError, match='Task capacity exceeds worker capacity'):
+        ExecutionPolicy(8, task_capacities={'task': 9})
+
+
+def test_execute_assignment_reads_capacity_from_environment(monkeypatch):
+    environment = MockVectorEnvironment(8, tasks=['limited'], success_after=1)
+    environment.setup()
+    monkeypatch.setattr(environment, 'tasks', lambda: ['limited'])
+    monkeypatch.setattr(environment, 'task_capacity',
+                        lambda task: {'limited': 5}[task.task_id])
+    jobs = _jobs(6, ('limited', ))
+    clients = [MockPolicyClient() for _ in range(8)]
+    with pytest.raises(ValueError, match='task slot limit'):
+        execute_assignment(environment, clients, EpisodeAssignment(jobs), 2,
+                           None, True)
+    assert all(slot.current_task is None for slot in environment.environments)
+    results = execute_assignment(environment, clients,
+                                 EpisodeAssignment(jobs[:5]), 2, None, True)
+    assert len(results) == 8
+    assert results[5:] == [None] * 3
+    assert all(result.success for result in results[:5])
+    assert [client.call_count for client in clients] == [1] * 5 + [0] * 3
 
 
 class _Socket:
@@ -369,32 +399,37 @@ class _Socket:
         self.sent.append(frames)
 
 
-def _coordinator(capacity, jobs, requires_single_task=False):
+def _coordinator(capacity,
+                 jobs,
+                 requires_single_task=False,
+                 task_capacities=None):
     coordinator = DistributedEvaluationCoordinator(
         'inproc://assignments', 1, deployment_id='deployment')
     coordinator._scheduling_state = _SchedulingState.from_jobs(jobs)
-    slot = _WorkerSlot(
-        'simulator-worker-0',
-        b'worker',
-        0,
-        '0',
-        task_manifest=(jobs[0].task, ),
-        execution_policy=ExecutionPolicy(capacity, requires_single_task),
-        simulator_ready=True)
+    slot = _WorkerSlot('simulator-worker-0', b'worker', 0, '0')
     coordinator._worker_slots[slot.worker_id] = slot
-    coordinator._idle_worker_ids.append(slot.worker_id)
     coordinator._worker_router = _Socket()
+    tasks = {job.task.task_id: job.task for job in jobs}
+    coordinator._mark_worker_ready(
+        slot,
+        encode_frame({
+            'tasks': [to_jsonable(task) for task in tasks.values()],
+            'capacity': capacity,
+            'requires_single_task': requires_single_task,
+            'task_capacities': task_capacities or {},
+        }))
     return coordinator, slot
 
 
 @pytest.mark.parametrize('strict', [False, True])
 def test_dispatch_batches_by_declared_task_limit(strict):
-    tasks = [
-        TaskSpec('stack_bowls_random', metadata={'max_slots': 5}),
-        TaskSpec('stack_bowls')
-    ]
+    tasks = [TaskSpec('stack_bowls_random'), TaskSpec('stack_bowls')]
     jobs = build_episode_jobs(tasks, 25, 7, 'run')
-    coordinator, slot = _coordinator(8, jobs, requires_single_task=True)
+    coordinator, slot = _coordinator(
+        8,
+        jobs,
+        requires_single_task=True,
+        task_capacities={'stack_bowls_random': 5})
     coordinator._strict_worker_assignment = strict
     batches = {task.task_id: [] for task in tasks}
     dispatched = []
@@ -410,6 +445,30 @@ def test_dispatch_batches_by_declared_task_limit(strict):
     }
     assert dispatched == jobs
     assert slot.capacity == 8
+
+
+@pytest.mark.parametrize('task_capacities', [{}, {
+    'task': 4
+}, {
+    'task': 5,
+    'another': 2
+}])
+def test_worker_restart_rejects_changed_task_capacities(task_capacities):
+    coordinator, slot = _coordinator(8, _jobs(1), task_capacities={'task': 5})
+    coordinator._replace_worker_connection(
+        slot, routing_id=b'new', generation=1)
+    with pytest.raises(
+            ValueError, match='task capacities changed after restart'):
+        coordinator._mark_worker_ready(
+            slot,
+            encode_frame({
+                'tasks': [to_jsonable(task) for task in slot.task_manifest],
+                'capacity':
+                8,
+                'task_capacities':
+                task_capacities,
+            }))
+    assert not slot.is_ready
 
 
 @pytest.mark.parametrize('capacity', [1, 2, 10])

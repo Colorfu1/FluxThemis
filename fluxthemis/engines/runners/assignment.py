@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 from fluxthemis.structures import TaskSpec, positive_integer
 
 if TYPE_CHECKING:
+    from fluxthemis.environments.base import BaseEnvironment
     from fluxthemis.model_clients.base import BasePolicyClient
 
     from .episode import EpisodeJob
@@ -37,22 +38,41 @@ class ExecutionPolicy:
 
     capacity: int = 1
     requires_single_task: bool = False
+    task_capacities: Mapping[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         positive_integer(self.capacity, 'capacity')
         if type(self.requires_single_task) is not bool:
             raise TypeError('requires_single_task must be a boolean')
+        object.__setattr__(self, 'task_capacities', dict(self.task_capacities))
+        for capacity in self.task_capacities.values():
+            positive_integer(capacity, 'task capacity')
+            if capacity > self.capacity:
+                raise ValueError('Task capacity exceeds worker capacity')
 
-    def validate_capacity(self, capacity: int) -> None:
+    @classmethod
+    def from_environment(cls, environment: BaseEnvironment) -> ExecutionPolicy:
+        """Read capabilities after the environment is set up."""
+        task_capacities = {}
+        for value in environment.tasks():
+            task = TaskSpec.from_value(value)
+            capacity = environment.task_capacity(task)
+            if capacity < environment.num_envs:
+                task_capacities[task.task_id] = capacity
+        return cls(environment.num_envs, environment.requires_single_task,
+                   task_capacities)
+
+    def validate_capacity(self, capacity: int,
+                          task_capacities: Mapping[str, int]) -> None:
         if type(capacity) is not int or capacity != self.capacity:
             raise ValueError('Environment capacity changed after restart')
+        if task_capacities != self.task_capacities:
+            raise ValueError(
+                'Environment task capacities changed after restart')
 
     def task_capacity(self, task: TaskSpec) -> int:
-        """Bound an assignment by the task's declared native slot limit."""
-        return min(
-            self.capacity,
-            positive_integer(
-                task.metadata.get('max_slots', self.capacity), 'max_slots'))
+        """Read the environment's capacity for a task, or its default."""
+        return self.task_capacities.get(task.task_id, self.capacity)
 
     def validate_assignment(
             self,

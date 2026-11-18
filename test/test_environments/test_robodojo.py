@@ -1,12 +1,19 @@
+import json
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from fluxthemis.engines.runners.episode import build_context
+from fluxthemis.engines.runners.evaluation import (EvaluationRun,
+                                                   EvaluationSettings)
+from fluxthemis.engines.runners.resume import build_bundle, manifest
 from fluxthemis.environments import EnvironmentResetRequest
 from fluxthemis.environments.sim import robodojo
 from fluxthemis.environments.sim.robodojo import RoboDojoEnvironment
+from fluxthemis.evaluators import SuccessRateEvaluator
+from fluxthemis.reporters import MockEvaluationReporter
 
 
 class UnStableError(RuntimeError):
@@ -81,6 +88,11 @@ def runtime_environment(monkeypatch, tmp_path):
             'sim.yml': sim_cfg,
         }
         resolved, configs, natives = [], [], []
+        loaded_paths = []
+
+        def load_yaml(path):
+            loaded_paths.append(Path(path).name)
+            return deepcopy(files.get(Path(path).name, {}))
 
         def resolve(task_name, num_envs, sim):
             resolved.append((task_name, num_envs, deepcopy(sim)))
@@ -104,7 +116,8 @@ def runtime_environment(monkeypatch, tmp_path):
             ROOT_DIR=str(tmp_path),
             ENV_CONFIG_PATH=str(tmp_path / 'env_cfg'),
             BENCHMARK='RoboDojo',
-            load_yaml=lambda path: deepcopy(files.get(Path(path).name, {})),
+            load_yaml=load_yaml,
+            loaded_paths=loaded_paths,
             OmegaConf=SimpleNamespace(create=deepcopy, update=update),
             process_randomization=lambda config: config,
             process_config=lambda config, task_name: (config, 25),
@@ -142,7 +155,9 @@ def test_native_task_capacity_uses_runtime_resolver(runtime_environment,
     limit = min(capacity,
                 5 if clutter_env_limit is None else clutter_env_limit)
     assert 'max_slots' not in base.metadata
-    assert random.metadata['max_slots'] == limit
+    assert 'max_slots' not in random.metadata
+    assert env.task_capacity(base) == capacity
+    assert env.task_capacity(random) == limit
     env._activate_task(random)
     assert env.num_envs == capacity
     assert env._native_num_envs == limit
@@ -151,11 +166,77 @@ def test_native_task_capacity_uses_runtime_resolver(runtime_environment,
         assert config['eval_cfg']['num_envs'] == count
         assert config['sim']['seed'] == [0] * count
     assert [(task, count)
-            for task, count, _ in resolved] == [(random.task_id, capacity),
-                                                (base.task_id, capacity),
+            for task, count, _ in resolved] == [(base.task_id, capacity),
                                                 (random.task_id, capacity)]
+    assert env._runtime.loaded_paths.count('sim.yml') == 1
     assert all(sim['scene'].get('clutter_env_limit') == clutter_env_limit
                for _, _, sim in resolved)
+    env.close()
+
+
+@pytest.mark.parametrize('capacity', [1, 8])
+def test_task_metadata_context_and_resume_manifest_ignore_capacity(
+        runtime_environment, tmp_path, capacity):
+    env, _, _, _ = runtime_environment(capacity)
+    metadata = [
+        dict(
+            benchmark='robodojo',
+            task_name=name,
+            task_index=index,
+            dimension='generalization',
+            variant=variant,
+            base_task='stack_bowls')
+        for index, (name, variant) in enumerate((('stack_bowls', 'base'),
+                                                 ('stack_bowls_random',
+                                                  'random')))
+    ]
+    assert [task.metadata for task in env.tasks()] == metadata
+    for task in env.tasks():
+        context = build_context(task, 0, 7, {})
+        assert context['task_metadata'] == task.metadata
+        assert 'max_slots' not in json.dumps(context)
+
+    # Pre-capability run_start format: only task identity/benchmark metadata.
+    old_start = dict(
+        schema_version='1.0',
+        run_name='original',
+        started_at='2026-01-01T00:00:00+00:00',
+        base_seed=7,
+        episodes_per_task=1,
+        episodes_per_task_by_task={
+            'stack_bowls': 1,
+            'stack_bowls_random': 1
+        },
+        max_episode_steps=1000,
+        execute_horizon=None,
+        stop_on_success=True,
+        task_ids=['stack_bowls', 'stack_bowls_random'],
+        total_tasks=2,
+        total_episodes=2,
+        parallel_workers=1,
+        strict_worker_assignment=False,
+        tasks=[
+            dict(
+                task_id=m['task_name'],
+                task_index=index,
+                description='',
+                metadata=m) for index, m in enumerate(metadata)
+        ])
+    journal = dict(
+        event_type='run_start',
+        sequence=1,
+        run_session_id='original',
+        recorded_at=old_start['started_at'],
+        payload=old_start)
+    (tmp_path / 'events.jsonl').write_text(json.dumps(journal) + '\n')
+    bundle_path = tmp_path / 'resume.json'
+    bundle_path.write_text(json.dumps(build_bundle(tmp_path)))
+    with EvaluationRun(
+            EvaluationSettings(resume_path=str(bundle_path)),
+            SuccessRateEvaluator(), MockEvaluationReporter()) as run:
+        run.start(env.tasks(), 2)
+        assert manifest(run.start_payload) == manifest(old_start)
+        assert run.start_payload['restored_episodes'] == 0
     env.close()
 
 

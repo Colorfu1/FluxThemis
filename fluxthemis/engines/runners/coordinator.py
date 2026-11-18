@@ -522,9 +522,11 @@ class DistributedEvaluationCoordinator:
                 f'simulator worker {slot.worker_id!r} changed its task '
                 'manifest after restart')
         policy = ExecutionPolicy(
-            body.get('capacity', 1), body.get('requires_single_task', False))
+            body.get('capacity', 1), body.get('requires_single_task', False),
+            body.get('task_capacities', {}))
         if slot.task_manifest:
-            slot.execution_policy.validate_capacity(policy.capacity)
+            slot.execution_policy.validate_capacity(policy.capacity,
+                                                    policy.task_capacities)
         slot.execution_policy = policy
         slot.task_manifest = task_manifest
         slot.recovery_deadline = None

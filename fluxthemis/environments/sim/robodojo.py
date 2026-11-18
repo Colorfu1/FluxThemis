@@ -454,6 +454,8 @@ class RoboDojoEnvironment(BaseEnvironment):
         self._env = None
         self._simulation_app = None
         self._runtime: _PrelaunchRuntime | None = None
+        self._sim_cfg: Mapping[str, Any] | None = None
+        self._task_capacities: dict[str, int] = {}
         self._post: _PostlaunchRuntime | None = None
         self._physx_monitor = None
         self._original_cwd: str | None = None
@@ -578,14 +580,18 @@ class RoboDojoEnvironment(BaseEnvironment):
     def _configure_task_slots(self, runtime: _PrelaunchRuntime) -> None:
         eval_cfg = runtime.load_yaml(
             os.path.join(runtime.ENV_CONFIG_PATH, f'{self.env_cfg_type}.yml'))
-        sim_cfg = runtime.load_yaml(
+        self._sim_cfg = runtime.load_yaml(
             os.path.join(runtime.ENV_CONFIG_PATH, 'sim',
                          f"{eval_cfg['config']['sim']}.yml"))
-        for task in self._tasks:
-            if _is_random_task(task.task_id):
-                task.metadata['max_slots'] = (
-                    runtime.resolve_random_task_num_envs(
-                        task.task_id, self.num_envs, sim_cfg))
+        self._task_capacities = {
+            task.task_id:
+            runtime.resolve_random_task_num_envs(task.task_id, self.num_envs,
+                                                 self._sim_cfg)
+            for task in self._tasks
+        }
+
+    def task_capacity(self, task: TaskSpec) -> int:
+        return self._task_capacities[task.task_id]
 
     def _create_env_for_active_task(self) -> None:
         if self._runtime is None or self._post is None:
@@ -1192,9 +1198,7 @@ class RoboDojoEnvironment(BaseEnvironment):
         }
         env_cfg = runtime.OmegaConf.create({
             'sim':
-            runtime.load_yaml(
-                os.path.join(runtime.ENV_CONFIG_PATH, 'sim',
-                             f"{config['sim']}.yml")),
+            self._sim_cfg,
             'scene':
             runtime.load_yaml(
                 os.path.join(runtime.ENV_CONFIG_PATH, 'scene',
@@ -1214,8 +1218,7 @@ class RoboDojoEnvironment(BaseEnvironment):
             'deploy_cfg':
             deploy_cfg,
         })
-        native_num_envs = runtime.resolve_random_task_num_envs(
-            self._task.task_id, self.num_envs, env_cfg['sim'])
+        native_num_envs = self.task_capacity(self._task)
         env_cfg = runtime.process_randomization(env_cfg)
         env_cfg, _ = runtime.process_config(
             env_cfg, task_name=self._task.task_id)

@@ -287,8 +287,7 @@ def execute_assignment(
     result when it finishes, keeping inactive slots frozen until the group
     ends. Each slot owns its video recorder and rejection callback.
     """
-    policy = ExecutionPolicy(environment.num_envs,
-                             environment.requires_single_task)
+    policy = ExecutionPolicy.from_environment(environment)
     policy.validate_assignment(assignment, policy_clients)
     if max_episode_steps < 1 or (execute_horizon is not None
                                  and execute_horizon < 1):

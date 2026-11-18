@@ -22,13 +22,18 @@ from fluxthemis.reporters import MockEvaluationReporter
 class _ExecutionEnvironment(MockVectorEnvironment):
 
     def __init__(self, directory, reject_phase, requires_single_task,
-                 **kwargs):
+                 task_capacities, **kwargs):
         super().__init__(**kwargs)
         self.directory = Path(directory)
         self.reject_phase = reject_phase
         self.requires_single_task = requires_single_task
+        self.task_capacities = task_capacities
         for index, environment in enumerate(self.environments):
             environment.success_after = index * 2 + 1
+
+    def task_capacity(self, task):
+        assert all(environment.is_setup for environment in self.environments)
+        return self.task_capacities.get(task.task_id, self.num_envs)
 
     def reset_batch(self, requests):
         self.requests = requests
@@ -71,6 +76,7 @@ def _mock_worker_process(**kwargs):
             directory=config['directory'],
             reject_phase=config['reject_phase'],
             requires_single_task=config['requires_single_task'],
+            task_capacities={'mock': min(config['capacity'], 5)},
             num_envs=config['capacity']),
         policy_client=dict(type='MockPolicyClient', chunk_size=1),
         max_episode_steps=10)
@@ -78,7 +84,7 @@ def _mock_worker_process(**kwargs):
     worker._run_simulator_worker(**kwargs)
 
 
-@pytest.mark.parametrize('capacity', [1, 2, 3])
+@pytest.mark.parametrize('capacity', [1, 2, 3, 8])
 @pytest.mark.parametrize('reject_phase', [None, 'reset', 'step', 'mixed'])
 @pytest.mark.parametrize('requires_single_task', [False, True])
 def test_supervised_slot_execution(tmp_path, monkeypatch, capacity,
@@ -130,6 +136,10 @@ def test_supervised_slot_execution(tmp_path, monkeypatch, capacity,
     slot = coordinator._worker_slots['simulator-worker-0']
     assert slot.capacity == capacity
     assert slot.requires_single_task == requires_single_task
+    assert slot.execution_policy.task_capacities == ({
+        'mock': 5
+    } if capacity > 5 else {})
+    assert all(task.metadata == {} for task in slot.task_manifest)
     ends = [
         payload for kind, payload in reporter.events if kind == 'episode_end'
     ]

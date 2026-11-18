@@ -189,14 +189,14 @@ class _SimulatorWorker:
             environment.setup()
             tasks = tuple(
                 TaskSpec.from_value(task) for task in environment.tasks())
+            policy = ExecutionPolicy.from_environment(environment)
             socket.send_multipart([
                 encode_header('ready', **self._message_identity),
                 encode_frame({
                     'tasks': [to_jsonable(task) for task in tasks],
-                    'capacity':
-                    environment.num_envs,
-                    'requires_single_task':
-                    environment.requires_single_task
+                    'capacity': policy.capacity,
+                    'requires_single_task': policy.requires_single_task,
+                    'task_capacities': dict(policy.task_capacities),
                 }),
             ])
             self.ready_event.set()
