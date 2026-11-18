@@ -12,6 +12,12 @@ class UnStableError(RuntimeError):
     pass
 
 
+class PhysXBrokenError(RuntimeError):
+
+    def __init__(self, slots):
+        self.broken_envs = slots
+
+
 class _BatchNativeEnvironment:
 
     def __init__(self):
@@ -198,6 +204,61 @@ def test_runtime_invalid_layout_freezes_only_its_lane(batch_environment,
     assert native.take_action_cnt == [
         1 + int(1 <= slot < rejected_slot) for slot in range(capacity)
     ]
+
+
+@pytest.mark.parametrize('failure_at', ['reset', 'step', 'observation'])
+def test_physx_error_keeps_healthy_slots_observable(batch_environment,
+                                                    monkeypatch, failure_at):
+    env, native, requests = batch_environment
+    rejected_slot = len(requests) - 1
+    broken = set()
+    env._physx_monitor = SimpleNamespace(
+        reset=broken.clear, get_broken_envs=lambda: set(broken))
+    original_reset = native.reset
+    original_step = native.take_action_batch
+    original_observe = native.get_obs_batch
+
+    def check_physics():
+        live = {slot for slot in broken if not native.end_flag[slot]}
+        if live:
+            raise PhysXBrokenError(live)
+
+    def reset(seed):
+        original_reset(seed)
+        if failure_at == 'reset':
+            broken.add(rejected_slot)
+
+    def step(actions, env_idx_list):
+        if failure_at == 'step':
+            broken.add(rejected_slot)
+        check_physics()
+        original_step(actions, env_idx_list)
+
+    def observe(env_idx_list):
+        if failure_at == 'observation' and native.action_calls:
+            broken.add(rejected_slot)
+        # RoboDojo checks every live lane, even when only peers are requested.
+        check_physics()
+        return original_observe(env_idx_list)
+
+    monkeypatch.setattr(native, 'reset', reset)
+    monkeypatch.setattr(native, 'take_action_batch', step)
+    monkeypatch.setattr(native, 'get_obs_batch', observe)
+    resets = env.reset_batch(requests)
+    if failure_at == 'reset':
+        assert [reset.rejected
+                for reset in resets] == ([False] * rejected_slot + [True])
+    else:
+        transitions = env.step_batch([1] * len(requests))
+        assert [result.case_rejected for result in transitions
+                ] == ([False] * rejected_slot + [True])
+    assert native.end_flag[rejected_slot]
+    assert native.abort_calls == [[rejected_slot]]
+    transitions = env.step_batch(
+        [None if flag else 1 for flag in native.end_flag])
+    assert transitions[rejected_slot] is None
+    assert all(not result.case_rejected for result in transitions
+               if result is not None)
 
 
 def test_partial_native_reset_failure_keeps_healthy_slots(
