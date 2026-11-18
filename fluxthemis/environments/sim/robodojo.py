@@ -17,9 +17,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from fluxthemis.engines.runners.assignment import ExecutionPolicy
 from fluxthemis.engines.utils import ENVIRONMENTS
-from fluxthemis.structures import StepResult, TaskSpec
+from fluxthemis.structures import StepResult, TaskSpec, positive_integer
 
 from ..base import BaseEnvironment, EnvironmentReset, EnvironmentResetRequest
 from .robodojo_log_capture import FileLogCapture
@@ -398,7 +397,7 @@ class RoboDojoEnvironment(BaseEnvironment):
         if not isinstance(completion_diagnostics, bool):
             raise TypeError('completion_diagnostics must be a boolean')
         self.completion_diagnostics = completion_diagnostics
-        num_envs = ExecutionPolicy(num_envs).batch_size
+        num_envs = positive_integer(num_envs, 'num_envs')
         seed = self._nonnegative_integer(seed, 'seed')
 
         root_value = robodojo_root or os.environ.get(

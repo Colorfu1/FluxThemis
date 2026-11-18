@@ -4,6 +4,13 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 
+def positive_integer(value: int, name: str) -> int:
+    """Validate an integer count without accepting booleans or coercing it."""
+    if type(value) is not int or value < 1:
+        raise ValueError(f'{name} must be a positive integer')
+    return value
+
+
 @dataclass
 class TaskSpec:
     """A task exposed by an evaluation environment."""
@@ -48,7 +55,7 @@ class StepResult:
     info: Mapping[str, Any] = field(default_factory=dict)
     score: float | None = None
     # Omit this sample from episode results. The runner reports a step
-    # rejection so the coordinator retries the same layout.
+    # rejection so the coordinator selects a new, unused layout.
     case_rejected: bool = False
 
 

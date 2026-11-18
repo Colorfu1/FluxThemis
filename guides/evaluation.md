@@ -47,7 +47,7 @@ bash scripts/run_evaluation.sh \
   模型配置覆盖项应传给模型命令。
 - `--smoke` 对 LIBERO 选择 task 0，对 RoboDojo 选择 `put_bottles_into_dustbin`，
   对 RoboTwin 选择当前设置的 `adjust_bottle`（all 使用 clean），局数等于 sim 进程数
-  乘以 `episode_batch_size`（默认 1）。
+  乘以环境配置的 `num_envs`（默认 1）。
   `--full` 选择全部任务，保留 Python 配置的逐任务配额。
 - `--config` 可传多份配置，依次连接已启动的模型。若配置需要不同 checkpoint，
   用户应分别启动对应模型并分次评测，入口不会自动更换权重。
@@ -57,12 +57,13 @@ bash scripts/run_evaluation.sh \
 ## 单个模拟器的多个环境
 
 支持原生多环境的适配器可以在一个 worker 内同时推进多个 episode。在 Python
-评测配置中，将 `themis.evaluation.episode_batch_size` 与适配器的 `num_envs`
-设为相同值。`workers-per-gpu` 仍表示模拟器进程数；例如 2 个 worker、每个
+评测配置中，通过 `themis.evaluation.environment.num_envs` 设置容量，
+worker 将环境的实际容量通过 ready 消息上报给调度器。`workers-per-gpu` 仍表示
+模拟器进程数；例如 2 个 worker、每个
 `num_envs=4`，最多同时执行 8 个 episode。模型服务仍独立启动，模型请求按
 episode 分别发送，不要求模型一次推理整个环境 batch。
 
-每次分配最多包含 `episode_batch_size` 个 episode，允许尾批。环境通过 ready
+每次分配最多包含 `num_envs` 个 episode，允许尾批。环境通过 ready
 消息中的 `requires_single_task` 声明是否要求同任务组批；RoboDojo 声明此约束。
 例如一个 RoboDojo 任务配额为 25、容量为 10 时，分成 10、10、5；空槽位不启动
 episode，也不执行推理。dynamic 和 fixed 调度都按容量分配；fixed 只从该 worker
@@ -79,9 +80,11 @@ episode，也不执行推理。dynamic 和 fixed 调度都按容量分配；fixe
 不随 worker 数量或完成顺序变化。策略返回 `PolicyStop` 时只结束对应 slot，
 其余 slot 继续执行。策略自行声明完成的记录与环境判定的成功结果分别保存。
 
-reset 阶段拒绝初始 case 时，coordinator 为该 slot 分配未使用的 layout；step
-阶段拒绝时，重试相同 layout，受 `--simulator-restart-limit` 约束。健康 slot
-继续运行，被拒 slot 的录像单独丢弃。正常失败和达到步数上限仍是完成的评测结果。
+reset 或 step 阶段拒绝 case 时，coordinator 都为该 slot 分配未使用的 layout，
+优先补足被拒的 episode。被拒样本不计入成功、失败、Score 或 episode 耗时，
+不消耗 `--simulator-restart-limit` 的进程重启预算，也没有额外的拒绝次数上限。
+phase 只用于日志。健康 slot 继续运行，被拒 slot 的录像单独丢弃。
+正常失败和达到步数上限仍是完成的评测结果。
 现有 `--resume` 流程可以重放已确认的结果，再执行剩余 episode。
 
 适配器接入要求：
