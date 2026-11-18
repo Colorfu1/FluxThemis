@@ -68,6 +68,8 @@ episode 分别发送，不要求模型一次推理整个环境 batch。
 例如一个 RoboDojo 任务配额为 25、容量为 10 时，分成 10、10、5；空槽位不启动
 episode，也不执行推理。dynamic 和 fixed 调度都按容量分配；fixed 只从该 worker
 固定配对的 episode 中取 job，重试 job 也可以组批。
+RoboDojo 的 `_random` 任务受 `sim.scene.clutter_env_limit`（默认 5）限制，
+调度时按 worker 容量与该任务上限的较小值组批。
 
 `episode_timeout_s` 限制整组 assignment 的总运行时间，包括 reset、模型推理、
 环境执行和录像收尾。增加 slot 数不会增加超时预算，完成一个 slot 也不会延长

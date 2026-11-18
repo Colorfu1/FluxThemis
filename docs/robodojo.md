@@ -57,13 +57,15 @@ task and its `_random` variant gets 25 episodes; other tasks get 50.
 See the config for quotas and the [environment task groups](../fluxthemis/environments/sim/robodojo.py)
 for case-sensitive task IDs. Unstable layouts are replaced with spare layouts,
 so available layouts may need to exceed the accepted episode quota.
-RoboDojo reports rejected cases per slot. Both reset and step rejections
-select a new, unused layout without counting the rejected sample in success,
-failure, score or episode duration metrics. Case rejections do not consume the
-simulator restart budget. Healthy slots continue, and each rejected slot's
-video is discarded.
-Single and multiple environments use the same native batch methods. Each
-slot finalizes its own videos when its episode ends.
+
+Multiple RoboDojo scenes can share one simulator worker. Set
+`themis.evaluation.environment.num_envs` in the evaluation config. Each
+assignment contains episodes of one task, and `episode_timeout_s` covers the
+whole assignment, so raise it with `num_envs`. As in native RoboDojo
+evaluation, `_random` tasks use at most `sim.scene.clutter_env_limit` scenes
+(5 by default); larger capacities apply to other tasks. See
+[multiple environments per simulator](../guides/evaluation.md#单个模拟器的多个环境)
+for scheduling, case rejection and video behavior.
 
 The default config uses three cameras, 14D joint actions, `base_seed=0`, at most
 2,000 action steps per episode and up to 50 actions per prediction. Policy seeds

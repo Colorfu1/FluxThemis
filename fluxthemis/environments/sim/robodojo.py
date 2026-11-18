@@ -255,6 +255,7 @@ class _PrelaunchRuntime:
     load_yaml: Any
     process_config: Any
     process_randomization: Any
+    resolve_random_task_num_envs: Any
 
 
 @dataclass(frozen=True)
@@ -311,7 +312,9 @@ def _load_prelaunch_runtime() -> _PrelaunchRuntime:
         from omegaconf import OmegaConf
         from src.eval_client.physx_warning_monitor import get_monitor
         from utils.load_file import load_yaml
-        from utils.pipeline_utils import process_config, process_randomization
+        from utils.pipeline_utils import (process_config,
+                                          process_randomization,
+                                          resolve_random_task_num_envs)
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             'RoboDojoEnvironment requires the RoboDojo simulation stack. '
@@ -330,6 +333,7 @@ def _load_prelaunch_runtime() -> _PrelaunchRuntime:
         load_yaml=load_yaml,
         process_config=process_config,
         process_randomization=process_randomization,
+        resolve_random_task_num_envs=resolve_random_task_num_envs,
     )
 
 
@@ -409,6 +413,7 @@ class RoboDojoEnvironment(BaseEnvironment):
         self.device_id = device_id
         self.headless = headless
         self._num_envs = num_envs
+        self._native_num_envs = num_envs
         self.seed = int(seed)
         self.worker_id: str | None = None
         self.run_id: str | None = None
@@ -469,6 +474,7 @@ class RoboDojoEnvironment(BaseEnvironment):
         self._prepare_runtime_paths()
         self._configure_run_identity()
         runtime = _load_prelaunch_runtime()
+        self._configure_task_slots(runtime)
         physx_monitor = runtime.get_physx_monitor()
         log_directory = tempfile.mkdtemp(prefix='fluxthemis-isaac-')
         self._isaac_runtime_dir = Path(log_directory)
@@ -569,6 +575,18 @@ class RoboDojoEnvironment(BaseEnvironment):
                 'selected tasks; a smoke asset subset cannot run task=all.')
         return counts
 
+    def _configure_task_slots(self, runtime: _PrelaunchRuntime) -> None:
+        eval_cfg = runtime.load_yaml(
+            os.path.join(runtime.ENV_CONFIG_PATH, f'{self.env_cfg_type}.yml'))
+        sim_cfg = runtime.load_yaml(
+            os.path.join(runtime.ENV_CONFIG_PATH, 'sim',
+                         f"{eval_cfg['config']['sim']}.yml"))
+        for task in self._tasks:
+            if _is_random_task(task.task_id):
+                task.metadata['max_slots'] = (
+                    runtime.resolve_random_task_num_envs(
+                        task.task_id, self.num_envs, sim_cfg))
+
     def _create_env_for_active_task(self) -> None:
         if self._runtime is None or self._post is None:
             raise RuntimeError('RoboDojo runtime was not initialized')
@@ -592,6 +610,10 @@ class RoboDojoEnvironment(BaseEnvironment):
             # RoboDojo's native runner to finalize it.
             env._stream_vision = lambda *args, **kwargs: None
         self._env = env
+        self._native_num_envs = env_cfg['eval_cfg']['num_envs']
+        self._batch_requests = [None] * self._native_num_envs
+        self._batch_inactive = set(range(self._native_num_envs))
+        self._video_finalized_slots = set(self._batch_inactive)
 
     def _activate_task(self, task: TaskSpec) -> None:
         self._finalize_active_episodes('truncated')
@@ -658,7 +680,7 @@ class RoboDojoEnvironment(BaseEnvironment):
     def finalize_episode(self, slot: int, *, success: bool,
                          termination_reason: str) -> dict:
         slot = self._nonnegative_integer(slot, 'slot')
-        if slot >= self.num_envs:
+        if slot >= self._native_num_envs:
             raise ValueError('slot is outside the native batch')
         if not self._episode_active:
             return {}
@@ -690,23 +712,28 @@ class RoboDojoEnvironment(BaseEnvironment):
         task = TaskSpec.from_value(requests[active[0]].task)
         if task.task_id not in self._task_ids:
             raise ValueError('RoboDojo reset requires a configured task')
-        layouts = [
-            None if request is None else self._nonnegative_integer(
-                request.environment_case_index, 'environment_case_index')
-            for request in requests
-        ]
         self._require_setup()
         if task.task_id != self._task.task_id:
             self._activate_task(task)
-        elif self._episode_active:
+        if any(request is not None
+               for request in requests[self._native_num_envs:]):
+            raise ValueError(
+                'RoboDojo slots outside the native batch must be None')
+        native_requests = requests[:self._native_num_envs]
+        layouts = [
+            None if request is None else self._nonnegative_integer(
+                request.environment_case_index, 'environment_case_index')
+            for request in native_requests
+        ]
+        if self._episode_active:
             self._finalize_active_episodes('truncated')
             self._close_native_env()
         if self._physx_monitor is not None:
             self._physx_monitor.reset()
         # Track even a partly initialized reset so cleanup owns every writer.
         self._episode_active = True
-        self._batch_requests = list(requests)
-        self._batch_inactive = set(range(self.num_envs)) - set(active)
+        self._batch_requests = native_requests
+        self._batch_inactive = set(range(self._native_num_envs)) - set(active)
         self._video_finalized_slots = set(self._batch_inactive)
         rejected = set()
         try:
@@ -763,13 +790,17 @@ class RoboDojoEnvironment(BaseEnvironment):
         self._require_episode()
         if len(actions) != self.num_envs:
             raise ValueError('RoboDojo step requires one entry per slot')
+        if any(action is not None
+               for action in actions[self._native_num_envs:]):
+            raise ValueError(
+                'RoboDojo slots outside the native batch must be None')
         active = [
             slot for slot, action in enumerate(actions) if action is not None
         ]
         if self._batch_inactive.intersection(active):
             raise ValueError('Cannot reactivate a finished RoboDojo slot')
         action_dicts = [self._action_to_dict(actions[slot]) for slot in active]
-        for slot, action in enumerate(actions):
+        for slot, action in enumerate(actions[:self._native_num_envs]):
             if action is None:
                 self._batch_inactive.add(slot)
                 self._env.end_flag[slot] = True
@@ -923,7 +954,7 @@ class RoboDojoEnvironment(BaseEnvironment):
         if self._physx_monitor is not None:
             self._physx_monitor.shutdown()
             self._physx_monitor = None
-        self._video_finalized_slots = set(range(self.num_envs))
+        self._video_finalized_slots = set(range(self._native_num_envs))
 
     def _finalize_video(self, slot: int,
                         request: EnvironmentResetRequest | None,
@@ -1183,13 +1214,15 @@ class RoboDojoEnvironment(BaseEnvironment):
             'deploy_cfg':
             deploy_cfg,
         })
+        native_num_envs = runtime.resolve_random_task_num_envs(
+            self._task.task_id, self.num_envs, env_cfg['sim'])
         env_cfg = runtime.process_randomization(env_cfg)
         env_cfg, _ = runtime.process_config(
             env_cfg, task_name=self._task.task_id)
         runtime.OmegaConf.update(
-            env_cfg, 'sim.scene.num_envs', self.num_envs, force_add=True)
+            env_cfg, 'sim.scene.num_envs', native_num_envs, force_add=True)
         runtime.OmegaConf.update(
-            env_cfg, 'eval_cfg.num_envs', self.num_envs, force_add=True)
+            env_cfg, 'eval_cfg.num_envs', native_num_envs, force_add=True)
         runtime.OmegaConf.update(
             env_cfg,
             'camera.default_frequency',
@@ -1197,7 +1230,7 @@ class RoboDojoEnvironment(BaseEnvironment):
             force_add=True,
         )
         runtime.OmegaConf.update(
-            env_cfg, 'sim.seed', [0] * self.num_envs, force_add=True)
+            env_cfg, 'sim.seed', [0] * native_num_envs, force_add=True)
         return env_cfg
 
     @property

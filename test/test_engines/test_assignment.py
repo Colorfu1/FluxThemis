@@ -332,6 +332,30 @@ def test_capacity_and_declared_task_capability_validation():
         ExecutionPolicy(2, requires_single_task='yes')
 
 
+def test_assignment_respects_task_limit_with_full_worker_client_container():
+    task = TaskSpec('limited', metadata={'max_slots': 5})
+    jobs = build_episode_jobs([task], 8, 7, 'run')
+    policy = ExecutionPolicy(8, requires_single_task=True)
+    clients = [MockPolicyClient() for _ in range(8)]
+    policy.validate_assignment(EpisodeAssignment(jobs[:5]), clients)
+    with pytest.raises(ValueError, match='task slot limit'):
+        policy.validate_assignment(EpisodeAssignment(jobs[:6]), clients)
+    with pytest.raises(ValueError, match='sizes differ'):
+        policy.validate_assignment(EpisodeAssignment(jobs[:5]), clients[:5])
+    assert policy.task_capacity(TaskSpec('unlimited')) == 8
+    assert policy.task_capacity(
+        TaskSpec('larger', metadata={'max_slots': 12})) == 8
+
+
+@pytest.mark.parametrize('limit', [0, -1, True, 1.5, None])
+def test_task_slot_limit_validation(limit):
+    jobs = build_episode_jobs(
+        [TaskSpec('task', metadata={'max_slots': limit})], 1, 7, 'run')
+    with pytest.raises(
+            ValueError, match='max_slots must be a positive integer'):
+        ExecutionPolicy(8).validate_assignment(EpisodeAssignment(jobs))
+
+
 class _Socket:
 
     def __init__(self):
@@ -361,6 +385,31 @@ def _coordinator(capacity, jobs, requires_single_task=False):
     coordinator._idle_worker_ids.append(slot.worker_id)
     coordinator._worker_router = _Socket()
     return coordinator, slot
+
+
+@pytest.mark.parametrize('strict', [False, True])
+def test_dispatch_batches_by_declared_task_limit(strict):
+    tasks = [
+        TaskSpec('stack_bowls_random', metadata={'max_slots': 5}),
+        TaskSpec('stack_bowls')
+    ]
+    jobs = build_episode_jobs(tasks, 25, 7, 'run')
+    coordinator, slot = _coordinator(8, jobs, requires_single_task=True)
+    coordinator._strict_worker_assignment = strict
+    batches = {task.task_id: [] for task in tasks}
+    dispatched = []
+    while coordinator._scheduling_state.pending_jobs:
+        coordinator._dispatch_jobs()
+        assignment = slot.assignment
+        batches[assignment.jobs[0].task.task_id].append(len(assignment.jobs))
+        dispatched.extend(assignment.jobs)
+        coordinator._release_worker_slot(slot)
+    assert batches == {
+        'stack_bowls_random': [5] * 5,
+        'stack_bowls': [8, 8, 8, 1]
+    }
+    assert dispatched == jobs
+    assert slot.capacity == 8
 
 
 @pytest.mark.parametrize('capacity', [1, 2, 10])

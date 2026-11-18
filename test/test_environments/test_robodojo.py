@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +60,165 @@ class _BatchNativeEnvironment:
     def save_video(self, slot, path, tag):
         self.video_calls.append((slot, tag))
         Path(path.replace('.mp4', f'_camera_{tag}.mp4')).write_bytes(b'video')
+
+
+@pytest.fixture
+def runtime_environment(monkeypatch, tmp_path):
+    """Build real adapter configs and switch scenes without launching Kit."""
+    monkeypatch.setenv('ROBODOJO_RUN_ID', 'test-slots')
+    monkeypatch.setattr(robodojo, 'robodojo_obs_to_flat', lambda obs: obs)
+
+    def build(capacity=8, clutter_env_limit=None):
+        sim_cfg = {'scene': {}}
+        if clutter_env_limit is not None:
+            sim_cfg['scene']['clutter_env_limit'] = clutter_env_limit
+        files = {
+            'arx_x5.yml': {
+                'config':
+                dict(sim='sim', scene='scene', camera='camera', robot='robot'),
+                'observation': {},
+            },
+            'sim.yml': sim_cfg,
+        }
+        resolved, configs, natives = [], [], []
+
+        def resolve(task_name, num_envs, sim):
+            resolved.append((task_name, num_envs, deepcopy(sim)))
+            return (min(num_envs, sim['scene'].get('clutter_env_limit', 5))
+                    if task_name.endswith('_random') else num_envs)
+
+        def update(config, path, value, force_add):
+            keys = path.split('.')
+            for key in keys[:-1]:
+                config = config.setdefault(key, {})
+            config[keys[-1]] = value
+
+        def create(config, app):
+            configs.append(deepcopy(config))
+            native = _BatchNativeEnvironment()
+            native.save_dir = tmp_path
+            natives.append(native)
+            return native
+
+        runtime = SimpleNamespace(
+            ROOT_DIR=str(tmp_path),
+            ENV_CONFIG_PATH=str(tmp_path / 'env_cfg'),
+            BENCHMARK='RoboDojo',
+            load_yaml=lambda path: deepcopy(files.get(Path(path).name, {})),
+            OmegaConf=SimpleNamespace(create=deepcopy, update=update),
+            process_randomization=lambda config: config,
+            process_config=lambda config, task_name: (config, 25),
+            resolve_random_task_num_envs=resolve)
+        env = RoboDojoEnvironment(
+            task_name=['stack_bowls', 'stack_bowls_random'],
+            num_envs=capacity,
+            robodojo_root=tmp_path,
+            save_videos=True,
+            video_dir=tmp_path)
+        env._configure_task_slots(runtime)
+        env._runtime = runtime
+        env._post = SimpleNamespace(
+            task_registry=SimpleNamespace(task_config_path=lambda directory,
+                                          task: f'{directory}/{task}.yml'),
+            create_eval_env=create)
+        env._simulation_app = SimpleNamespace(close=lambda: None)
+        monkeypatch.setattr(env, '_sync_runtime_paths', lambda: None)
+        monkeypatch.setattr(env, '_action_to_dict',
+                            lambda action: {'action': action})
+        env._activate_task(env.tasks()[0])
+        return env, natives, configs, resolved
+
+    return build
+
+
+@pytest.mark.parametrize('capacity', [1, 5, 8])
+@pytest.mark.parametrize('clutter_env_limit', [None, 3, 12])
+def test_native_task_capacity_uses_runtime_resolver(runtime_environment,
+                                                    capacity,
+                                                    clutter_env_limit):
+    env, natives, configs, resolved = runtime_environment(
+        capacity, clutter_env_limit)
+    base, random = env.tasks()
+    limit = min(capacity,
+                5 if clutter_env_limit is None else clutter_env_limit)
+    assert 'max_slots' not in base.metadata
+    assert random.metadata['max_slots'] == limit
+    env._activate_task(random)
+    assert env.num_envs == capacity
+    assert env._native_num_envs == limit
+    for config, count in zip(configs, (capacity, limit)):
+        assert config['sim']['scene']['num_envs'] == count
+        assert config['eval_cfg']['num_envs'] == count
+        assert config['sim']['seed'] == [0] * count
+    assert [(task, count)
+            for task, count, _ in resolved] == [(random.task_id, capacity),
+                                                (base.task_id, capacity),
+                                                (random.task_id, capacity)]
+    assert all(sim['scene'].get('clutter_env_limit') == clutter_env_limit
+               for _, _, sim in resolved)
+    env.close()
+
+
+@pytest.mark.parametrize('invalid_slot', [5, 6, 7])
+def test_random_task_requires_empty_slots_beyond_native_scenes(
+        runtime_environment, invalid_slot):
+    env, natives, _, _ = runtime_environment()
+    task = env.tasks()[1]
+    requests = [
+        EnvironmentResetRequest(task, slot, slot, slot) for slot in range(5)
+    ] + [None] * 3
+    invalid = list(requests)
+    invalid[invalid_slot] = EnvironmentResetRequest(task, invalid_slot, 0, 99)
+    with pytest.raises(ValueError, match='outside the native batch'):
+        env.reset_batch(invalid)
+    native = natives[-1]
+    assert not native.reset_calls
+    resets = env.reset_batch(requests)
+    assert native.reset_calls == [list(range(5))]
+    assert len(resets) == 8 and resets[5:] == [None] * 3
+    assert [reset.observation['slot']
+            for reset in resets[:5]] == list(range(5))
+    actions = [1] * 5 + [None] * 3
+    invalid = list(actions)
+    invalid[invalid_slot] = 1
+    with pytest.raises(ValueError, match='outside the native batch'):
+        env.step_batch(invalid)
+    assert not native.action_calls
+    transitions = env.step_batch(actions)
+    assert len(transitions) == 8 and transitions[5:] == [None] * 3
+    assert native.action_calls[-1][1] == list(range(5))
+    assert len(native.end_flag) == 5
+    with pytest.raises(ValueError, match='outside the native batch'):
+        env.finalize_episode(
+            invalid_slot, success=False, termination_reason='terminated')
+    env.close()
+    assert native.video_calls == [(slot, 'truncated') for slot in range(5)]
+    assert env._video_finalized_slots == set(range(5))
+
+
+def test_switching_tasks_resizes_native_state_and_preserves_video_ownership(
+        runtime_environment):
+    env, natives, _, _ = runtime_environment()
+    base, random = env.tasks()
+    for task, count in ((base, 8), (random, 5), (base, 8)):
+        requests = [
+            EnvironmentResetRequest(task, slot, slot, slot)
+            for slot in range(count)
+        ] + [None] * (8 - count)
+        resets = env.reset_batch(requests)
+        assert len(resets) == env.num_envs == 8
+        assert len(env._batch_requests) == count
+        assert env._batch_inactive == set()
+        assert env._video_finalized_slots == set()
+        env.finalize_episode(
+            count - 1, success=False, termination_reason='case_rejected')
+        assert natives[-1].abort_calls == [[count - 1]]
+        assert env._batch_inactive == {count - 1}
+    env.close()
+    assert [native.video_calls
+            for native in natives] == [[(slot, 'truncated')
+                                        for slot in range(count - 1)]
+                                       for count in (8, 5, 8)]
 
 
 @pytest.fixture(params=[1, 3])

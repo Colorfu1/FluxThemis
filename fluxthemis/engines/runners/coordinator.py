@@ -547,6 +547,7 @@ class DistributedEvaluationCoordinator:
             if slot is None:
                 return
             jobs = []
+            capacity = slot.capacity
             for job in list(state.pending_jobs):
                 if self._strict_worker_assignment:
                     index = ((job.global_episode_number - 1) %
@@ -556,9 +557,13 @@ class DistributedEvaluationCoordinator:
                 if (jobs and slot.requires_single_task
                         and job.task != jobs[0].task):
                     continue
+                task_capacity = slot.execution_policy.task_capacity(job.task)
+                if len(jobs) >= task_capacity:
+                    continue
                 jobs.append(job)
                 state.pending_jobs.remove(job)
-                if len(jobs) == slot.capacity:
+                capacity = min(capacity, task_capacity)
+                if len(jobs) == capacity:
                     break
             if jobs:
                 self._assign_jobs(slot, jobs)

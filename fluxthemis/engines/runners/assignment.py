@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Sequence
 
-from fluxthemis.structures import positive_integer
+from fluxthemis.structures import TaskSpec, positive_integer
 
 if TYPE_CHECKING:
     from fluxthemis.model_clients.base import BasePolicyClient
@@ -47,6 +47,13 @@ class ExecutionPolicy:
         if type(capacity) is not int or capacity != self.capacity:
             raise ValueError('Environment capacity changed after restart')
 
+    def task_capacity(self, task: TaskSpec) -> int:
+        """Bound an assignment by the task's declared native slot limit."""
+        return min(
+            self.capacity,
+            positive_integer(
+                task.metadata.get('max_slots', self.capacity), 'max_slots'))
+
     def validate_assignment(
             self,
             assignment: EpisodeAssignment,
@@ -57,6 +64,10 @@ class ExecutionPolicy:
                 job.task != assignment.jobs[0].task
                 for job in assignment.jobs):
             raise ValueError('Environment requires one task per assignment')
+        if any(
+                len(assignment.jobs) > self.task_capacity(job.task)
+                for job in assignment.jobs):
+            raise ValueError('Assignment exceeds task slot limit')
         if policy_clients is not None:
             if len(policy_clients) != self.capacity:
                 raise ValueError('Environment and policy client sizes differ')
