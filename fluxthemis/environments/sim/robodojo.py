@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from numbers import Integral
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -714,8 +714,9 @@ class RoboDojoEnvironment(BaseEnvironment):
         except Exception as exc:
             if not _is_recoverable_robodojo_case_error(exc):
                 raise
-            rejected.update(self._rejected_reset_slots(active) or active)
+            rejected.update(self._rejected_reset_slots(active, exc) or active)
         rejected.update(self._rejected_reset_slots(active))
+        self._deactivate_rejected_slots(rejected)
         healthy = [slot for slot in active if slot not in rejected]
         by_slot = {}
         if healthy:
@@ -736,8 +737,6 @@ class RoboDojoEnvironment(BaseEnvironment):
                 'environment_slot': slot,
             }
             if slot in rejected:
-                self._batch_inactive.add(slot)
-                self._abort_video(slot)
                 info['reason'] = 'RoboDojo initial layout is unstable'
                 results[slot] = EnvironmentReset(info=info, rejected=True)
                 continue
@@ -750,8 +749,10 @@ class RoboDojoEnvironment(BaseEnvironment):
             results[slot] = EnvironmentReset(converted, info)
         return results
 
-    def _rejected_reset_slots(self, active: Sequence[int]) -> list[int]:
-        unstable = set(getattr(self._env, 'unstable_envs', ()))
+    def _rejected_reset_slots(self,
+                              active: Sequence[int],
+                              error: BaseException | None = None) -> list[int]:
+        unstable = set(self._rejected_step_slots(active, error))
         end_flags = getattr(self._env, 'end_flag', ())
         return [
             slot for slot in active
@@ -783,17 +784,15 @@ class RoboDojoEnvironment(BaseEnvironment):
         except Exception as exc:
             if not _is_recoverable_robodojo_case_error(exc):
                 raise
-            unstable.update(self._rejected_step_slots(active) or active)
+            unstable.update(self._rejected_step_slots(active, exc) or active)
         unstable.update(self._rejected_step_slots(active))
+        self._deactivate_rejected_slots(unstable)
         observed = [slot for slot in active if slot not in unstable]
         by_slot, rejected_observations = self._observe_slots(observed, 'step')
         unstable.update(rejected_observations)
         for slot in active:
             request = self._batch_requests[slot]
             if slot in unstable:
-                self._batch_inactive.add(slot)
-                self._env.end_flag[slot] = True
-                self._abort_video(slot)
                 results[slot] = StepResult(
                     observation={},
                     case_rejected=True,
@@ -831,9 +830,24 @@ class RoboDojoEnvironment(BaseEnvironment):
                 self._batch_inactive.add(slot)
         return results
 
-    def _rejected_step_slots(self, active: Sequence[int]) -> list[int]:
+    def _rejected_step_slots(self,
+                             active: Sequence[int],
+                             error: BaseException | None = None) -> list[int]:
         unstable = set(getattr(self._env, 'unstable_envs', ()))
+        unstable.update(getattr(error, 'broken_envs', ()))
+        if self._physx_monitor is not None:
+            unstable.update(self._physx_monitor.get_broken_envs())
         return [slot for slot in active if slot in unstable]
+
+    def _deactivate_rejected_slots(self, slots: Iterable[int]) -> None:
+        # Native observations check all live lanes for PhysX errors. Mask bad
+        # lanes before observing their healthy peers, including after reset.
+        end_flags = getattr(self._env, 'end_flag', ())
+        for slot in slots:
+            self._batch_inactive.add(slot)
+            if slot < len(end_flags):
+                end_flags[slot] = True
+            self._abort_video(slot)
 
     def _observe_slots(self, active: list[int],
                        phase: str) -> tuple[dict[int, Any], set[int]]:
@@ -850,7 +864,8 @@ class RoboDojoEnvironment(BaseEnvironment):
                     raise
                 # Each failed capture removes at least one slot. A native
                 # error without slot identities rejects the unobserved slots.
-                rejected.update(rejected_slots(remaining) or remaining)
+                rejected.update(rejected_slots(remaining, exc) or remaining)
+                self._deactivate_rejected_slots(rejected)
                 remaining = [
                     slot for slot in remaining if slot not in rejected
                 ]
@@ -859,6 +874,7 @@ class RoboDojoEnvironment(BaseEnvironment):
                 raise RuntimeError(
                     'RoboDojo returned an incomplete observation batch')
             rejected.update(rejected_slots(remaining))
+            self._deactivate_rejected_slots(rejected)
             return dict(zip(remaining, observations)), rejected
         return {}, rejected
 
