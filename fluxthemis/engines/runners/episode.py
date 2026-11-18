@@ -300,9 +300,9 @@ def execute_assignment(
                                 job.environment_seed,
                                 job.environment_case_index) for job in jobs
     ]
-    requests.extend([None] * (policy.batch_size - len(jobs)))
-    states: list[_EpisodeState | None] = [None] * policy.batch_size
-    recorders: list[EpisodeVideoRecorder | None] = [None] * policy.batch_size
+    requests.extend([None] * (policy.capacity - len(jobs)))
+    states: list[_EpisodeState | None] = [None] * policy.capacity
+    recorders: list[EpisodeVideoRecorder | None] = [None] * policy.capacity
 
     def reject_case(slot: int, job: EpisodeJob, phase: str,
                     info: Mapping[str, Any]) -> None:
@@ -343,7 +343,7 @@ def execute_assignment(
 
     try:
         resets = environment.reset_batch(requests)
-        if len(resets) != policy.batch_size:
+        if len(resets) != policy.capacity:
             raise ValueError('reset_batch returned the wrong number of slots')
         for slot, (client, reset) in enumerate(zip(policy_clients, resets)):
             if slot >= len(jobs):
@@ -376,7 +376,7 @@ def execute_assignment(
                 recorder.capture(environment, slot)
         while any(state is not None and state.result is None
                   for state in states):
-            actions = [None] * policy.batch_size
+            actions = [None] * policy.capacity
             for slot, state in enumerate(states):
                 if state is None or state.result is not None:
                     continue
@@ -388,7 +388,7 @@ def execute_assignment(
             if not any(action is not None for action in actions):
                 continue
             transitions = environment.step_batch(actions)
-            if len(transitions) != policy.batch_size:
+            if len(transitions) != policy.capacity:
                 raise ValueError(
                     'step_batch returned the wrong number of slots')
             for slot, (state,

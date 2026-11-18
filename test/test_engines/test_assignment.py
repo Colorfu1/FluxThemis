@@ -305,9 +305,9 @@ def test_nonfinite_score_is_rejected(capacity):
 
 
 @pytest.mark.parametrize('value', [0, -1, True, 1.5])
-def test_batch_size_validation(value):
+def test_capacity_validation(value):
     with pytest.raises(ValueError, match='positive integer'):
-        EvaluationSettings(episode_batch_size=value)
+        ExecutionPolicy(value)
 
 
 def test_capacity_and_declared_task_capability_validation():
@@ -326,7 +326,7 @@ def test_capacity_and_declared_task_capability_validation():
         policy.validate_assignment(mixed, [MockPolicyClient()])
     with pytest.raises(ValueError, match='own policy client'):
         policy.validate_assignment(mixed, [MockPolicyClient()] * 2)
-    with pytest.raises(ValueError, match='capacity differs'):
+    with pytest.raises(ValueError, match='capacity changed'):
         policy.validate_capacity(3)
     with pytest.raises(TypeError, match='requires_single_task'):
         ExecutionPolicy(2, requires_single_task='yes')
@@ -389,9 +389,8 @@ def test_worker_coordinator_roundtrip_waits_for_assignment_end(
     environment = MockVectorEnvironment(capacity, success_after=1)
     environment.setup()
     run = EvaluationRun(
-        EvaluationSettings(
-            episode_batch_size=capacity, episodes_per_task=count),
-        SuccessRateEvaluator(), MockEvaluationReporter())
+        EvaluationSettings(episodes_per_task=count), SuccessRateEvaluator(),
+        MockEvaluationReporter())
     with run:
         run.start([TaskSpec('a'), TaskSpec('b')], len(jobs))
         batch_sizes = []
@@ -661,9 +660,8 @@ def test_duplicate_results_are_idempotent_and_conflicts_fail():
     results = execute_assignment(env, [MockPolicyClient() for _ in jobs],
                                  slot.assignment, 5, None, True)
     reporter = MockEvaluationReporter()
-    with EvaluationRun(
-            EvaluationSettings(episode_batch_size=2), SuccessRateEvaluator(),
-            reporter) as run:
+    with EvaluationRun(EvaluationSettings(), SuccessRateEvaluator(),
+                       reporter) as run:
         run.start([jobs[0].task], 2)
         _receive_event(coordinator, slot, 'episode_start', job=jobs[0])
         coordinator._receive_worker_message(run)
@@ -736,9 +734,8 @@ def test_report_failure_does_not_commit_completion():
     result = execute_assignment(
         env, [MockPolicyClient(), MockPolicyClient()], slot.assignment, 5,
         None, True)[0]
-    with EvaluationRun(
-            EvaluationSettings(episode_batch_size=2), SuccessRateEvaluator(),
-            Reporter()) as run:
+    with EvaluationRun(EvaluationSettings(), SuccessRateEvaluator(),
+                       Reporter()) as run:
         run.start([jobs[0].task], 1)
         _receive_event(coordinator, slot, 'episode_start', job=jobs[0])
         coordinator._receive_worker_message(run)

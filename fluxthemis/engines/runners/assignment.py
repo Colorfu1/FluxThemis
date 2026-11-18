@@ -6,6 +6,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Sequence
 
+from fluxthemis.structures import positive_integer
+
 if TYPE_CHECKING:
     from fluxthemis.model_clients.base import BasePolicyClient
 
@@ -33,32 +35,30 @@ class EpisodeAssignment:
 class ExecutionPolicy:
     """Validate capacity and the capabilities declared by an environment."""
 
-    batch_size: int = 1
+    capacity: int = 1
     requires_single_task: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.batch_size) is not int or self.batch_size < 1:
-            raise ValueError('episode_batch_size must be a positive integer')
+        positive_integer(self.capacity, 'capacity')
         if type(self.requires_single_task) is not bool:
             raise TypeError('requires_single_task must be a boolean')
 
     def validate_capacity(self, capacity: int) -> None:
-        if type(capacity) is not int or capacity != self.batch_size:
-            raise ValueError(
-                'Environment capacity differs from episode_batch_size')
+        if type(capacity) is not int or capacity != self.capacity:
+            raise ValueError('Environment capacity changed after restart')
 
     def validate_assignment(
             self,
             assignment: EpisodeAssignment,
             policy_clients: Sequence[BasePolicyClient] | None = None) -> None:
-        if len(assignment.jobs) > self.batch_size:
+        if len(assignment.jobs) > self.capacity:
             raise ValueError('Assignment exceeds worker capacity')
         if self.requires_single_task and any(
                 job.task != assignment.jobs[0].task
                 for job in assignment.jobs):
             raise ValueError('Environment requires one task per assignment')
         if policy_clients is not None:
-            if len(policy_clients) != self.batch_size:
+            if len(policy_clients) != self.capacity:
                 raise ValueError('Environment and policy client sizes differ')
             if len({id(client)
                     for client in policy_clients}) != len(policy_clients):

@@ -176,14 +176,12 @@ class _SimulatorWorker:
                 evaluation_cfg)
             environment = build_environment_from_cfg(
                 evaluation_cfg['environment'])
-            policy = ExecutionPolicy(
-                evaluation_cfg.get('episode_batch_size', 1),
-                environment.requires_single_task)
-            policy.validate_capacity(environment.num_envs)
+            policy = ExecutionPolicy(environment.num_envs,
+                                     environment.requires_single_task)
             environment.configure_worker(self.worker_id, self.deployment_id)
             environment.configure_simulator_device(self.device)
             environment.configure_video_recording(save_videos, video_dir)
-            for _ in range(policy.batch_size):
+            for _ in range(policy.capacity):
                 client = build_policy_client_from_cfg(
                     evaluation_cfg['policy_client'])
                 policy_clients.append(client)

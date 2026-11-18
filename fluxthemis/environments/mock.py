@@ -4,9 +4,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from fluxthemis.engines.runners.assignment import ExecutionPolicy
 from fluxthemis.engines.utils import ENVIRONMENTS
-from fluxthemis.structures import StepResult, TaskSpec
+from fluxthemis.structures import StepResult, TaskSpec, positive_integer
 
 from .base import (BaseEnvironment, EnvironmentReset, EnvironmentResetRequest,
                    SingleEnvironmentAdapter)
@@ -95,7 +94,7 @@ class MockVectorEnvironment(BaseEnvironment):
     """CPU-only slot execution example; does not allocate real simulators."""
 
     def __init__(self, num_envs: int = 2, **environment_kwargs: Any) -> None:
-        self._num_envs = ExecutionPolicy(num_envs).batch_size
+        self._num_envs = positive_integer(num_envs, 'num_envs')
         self.environments = [
             MockEnvironment(**environment_kwargs) for _ in range(num_envs)
         ]

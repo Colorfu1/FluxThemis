@@ -42,7 +42,7 @@ class _WorkerSlot:
 
     @property
     def capacity(self) -> int:
-        return self.execution_policy.batch_size
+        return self.execution_policy.capacity
 
     @property
     def requires_single_task(self) -> bool:
@@ -78,6 +78,7 @@ class _SchedulingState:
     started_episode_ids: set[str]
     next_environment_case_index_by_task: dict[str, int]
     restart_counts_by_episode_id: dict[str, int]
+    replaced_cases_by_episode_id: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_jobs(cls, jobs: list[EpisodeJob]) -> _SchedulingState:
@@ -364,8 +365,14 @@ class DistributedEvaluationCoordinator:
             job = self._require_assigned_job(slot, header)
             if job.episode_id not in scheduling_state.started_episode_ids:
                 episode_start_payload = job.episode_start_payload(utc_now())
+                replacements = scheduling_state.replaced_cases_by_episode_id
+                previous_case = replacements.get(job.episode_id)
+                if previous_case is not None:
+                    episode_start_payload[
+                        'replaces_environment_case_index'] = previous_case
                 evaluation_run.on_episode_start(episode_start_payload)
                 scheduling_state.started_episode_ids.add(job.episode_id)
+                replacements.pop(job.episode_id, None)
         elif message_type == 'episode_end':
             job = self._require_assigned_job(
                 slot, header, allow_completed=True)
@@ -391,34 +398,31 @@ class DistributedEvaluationCoordinator:
                 return
             job = self._require_assigned_job(slot, header)
             phase = header.get('phase')
-            if phase == 'reset':
-                next_case_index = (
-                    scheduling_state.next_environment_case_index_by_task.get(
-                        job.task.task_id))
-                if next_case_index is None:
-                    raise RuntimeError(
-                        f'environment rejected job {job.episode_id!r} '
-                        'without an environment_case_index')
-                scheduling_state.next_environment_case_index_by_task[
-                    job.task.task_id] = next_case_index + 1
-                retry = replace(job, environment_case_index=next_case_index)
-                scheduling_state.jobs_by_episode_id[job.episode_id] = retry
-                scheduling_state.started_episode_ids.discard(job.episode_id)
-                scheduling_state.pending_jobs.append(retry)
-                print(
-                    f'[FluxThemis] simulator worker {slot.worker_id} rejected '
-                    f'environment case {job.environment_case_index} for '
-                    f'{job.task.task_id}; retrying '
-                    f'with case {next_case_index}',
-                    file=sys.stderr,
-                    flush=True)
-            elif phase == 'step':
-                if job.episode_id not in scheduling_state.started_episode_ids:
-                    raise RuntimeError(
-                        'Step rejection received before episode start')
-                self._requeue_restarted_job(job)
-            else:
+            if phase not in ('reset', 'step'):
                 raise ValueError('Case rejection phase must be reset or step')
+            next_case_index = (
+                scheduling_state.next_environment_case_index_by_task.get(
+                    job.task.task_id))
+            if next_case_index is None:
+                raise RuntimeError(
+                    f'environment rejected job {job.episode_id!r} '
+                    'without an environment_case_index')
+            scheduling_state.next_environment_case_index_by_task[
+                job.task.task_id] = next_case_index + 1
+            retry = replace(job, environment_case_index=next_case_index)
+            scheduling_state.jobs_by_episode_id[job.episode_id] = retry
+            if job.episode_id in scheduling_state.started_episode_ids:
+                scheduling_state.replaced_cases_by_episode_id[
+                    job.episode_id] = job.environment_case_index
+            scheduling_state.started_episode_ids.discard(job.episode_id)
+            scheduling_state.pending_jobs.appendleft(retry)
+            print(
+                f'[FluxThemis] simulator worker {slot.worker_id} rejected '
+                f'environment case {job.environment_case_index} during '
+                f'{phase} for {job.task.task_id}; replacing '
+                f'with case {next_case_index}',
+                file=sys.stderr,
+                flush=True)
             slot.completed_episode_ids.add(job.episode_id)
         else:
             raise RuntimeError(
@@ -456,7 +460,8 @@ class DistributedEvaluationCoordinator:
             device=device,
         )
 
-    def _recover_worker(self, slot: _WorkerSlot) -> None:
+    def _replace_worker_connection(self, slot: _WorkerSlot, *,
+                                   routing_id: bytes, generation: int) -> None:
         assignment = slot.assignment
         if assignment is not None:
             for job in reversed(assignment.jobs):
@@ -469,10 +474,6 @@ class DistributedEvaluationCoordinator:
                     f'simulator worker {slot.worker_id!r} exceeded startup '
                     f'restart limit {self.simulator_restart_limit}')
 
-    def _replace_worker_connection(self, slot: _WorkerSlot, *,
-                                   routing_id: bytes, generation: int) -> None:
-        assignment = slot.assignment
-        self._recover_worker(slot)
         self._idle_worker_ids = deque(worker_id
                                       for worker_id in self._idle_worker_ids
                                       if worker_id != slot.worker_id)
@@ -523,7 +524,7 @@ class DistributedEvaluationCoordinator:
         policy = ExecutionPolicy(
             body.get('capacity', 1), body.get('requires_single_task', False))
         if slot.task_manifest:
-            slot.execution_policy.validate_capacity(policy.batch_size)
+            slot.execution_policy.validate_capacity(policy.capacity)
         slot.execution_policy = policy
         slot.task_manifest = task_manifest
         slot.recovery_deadline = None

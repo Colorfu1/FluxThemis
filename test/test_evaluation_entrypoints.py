@@ -16,7 +16,7 @@ from fluxthemis.engines.runners.episode import (build_episode_jobs,
 from fluxthemis.engines.runners.evaluation import (EvaluationRun,
                                                    EvaluationSettings,
                                                    EvaluationStatus, utc_now)
-from fluxthemis.environments import MockEnvironment
+from fluxthemis.environments import MockVectorEnvironment
 from fluxthemis.evaluators import SuccessRateEvaluator
 from fluxthemis.model_clients import MockPolicyClient
 from fluxthemis.reporters import MockEvaluationReporter
@@ -39,8 +39,6 @@ def _config(capacity):
         evaluator=dict(type='SuccessRateEvaluator'),
         episodes_per_task=2,
         max_episode_steps=5)
-    if capacity != 1:
-        evaluation['episode_batch_size'] = capacity
     return Config(
         dict(
             themis=dict(
@@ -78,13 +76,32 @@ def test_launcher_accepts_batch_configuration(tmp_path, dry_run):
     if dry_run:
         output = Path(json.loads(pointer.read_text())['directory'])
         frozen = Config.fromfile(str(output / 'config_snapshot.py'))
-        assert frozen.themis.evaluation.episode_batch_size == 2
+        assert frozen.themis.evaluation.environment.num_envs == 2
         assert not (output / 'simulator.log').exists()
 
 
+@pytest.mark.parametrize('capacity', [None, 1, 3])
+def test_smoke_episode_count_uses_environment_capacity(monkeypatch, capacity):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
+    launcher = importlib.import_module('evaluation.config')
+    options = {} if capacity is None else {
+        'themis.evaluation.environment.num_envs': capacity
+    }
+    plan = launcher.load_config(
+        ROOT / 'configs/robodojo/arx_x5.py',
+        mode='smoke',
+        overrides=dict(gpu_ids='0,1', workers_per_gpu=2, cfg_options=options))
+    assert plan['simulator_workers'] == 4
+    assert plan['local']['episodes'] == 4 * (capacity or 1)
+    evaluation = plan['config'].themis.evaluation
+    assert evaluation.episodes_per_task == plan['local']['episodes']
+    assert evaluation.episodes_per_task_overrides[
+        'put_bottles_into_dustbin'] == plan['local']['episodes']
+
+
 @pytest.mark.parametrize('capacity', [1, 2])
-def test_prepare_resume_preserves_scalar_and_batch_results(
-        tmp_path, capacity, resume):
+def test_prepare_resume_preserves_slot_results(tmp_path, capacity, resume):
     source = tmp_path / 'stopped_run'
     source.mkdir()
     cfg = _config(capacity)
@@ -99,14 +116,13 @@ def test_prepare_resume_preserves_scalar_and_batch_results(
     tasks = [TaskSpec('task')]
     jobs = build_episode_jobs(tasks, 2, 7, reporter.run_session_id)
     with EvaluationRun(
-            EvaluationSettings(
-                episodes_per_task=2, episode_batch_size=capacity),
-            SuccessRateEvaluator(), reporter) as run:
+            EvaluationSettings(episodes_per_task=2), SuccessRateEvaluator(),
+            reporter) as run:
         run.start(tasks, 2)
-        environment = MockEnvironment(success_after=1)
+        environment = MockVectorEnvironment(capacity, success_after=1)
         environment.setup()
         result = execute_assignment(
-            environment, [MockPolicyClient()],
+            environment, [MockPolicyClient() for _ in range(capacity)],
             EpisodeAssignment([jobs[0]]),
             5,
             None,
@@ -116,9 +132,6 @@ def test_prepare_resume_preserves_scalar_and_batch_results(
         run.on_episode_end(result, jobs[0].episode_id)
         run.fail(EvaluationStatus.INTERRUPTED, None, result,
                  dict(error_type='KeyboardInterrupt', message='interrupted'))
-    if capacity == 1:
-        # Existing journals predate the optional batch setting.
-        reporter.events[0][1].pop('episode_batch_size')
     rows = [
         dict(
             event_type=kind,

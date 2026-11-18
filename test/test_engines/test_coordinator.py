@@ -140,12 +140,15 @@ def test_reconnecting_worker_requeues_active_episode():
 
 @pytest.mark.parametrize('phase', ['reset', 'step'])
 @pytest.mark.parametrize('capacity', [1, 3])
-def test_rejection_phase_decides_layout_selection(phase, capacity):
-    jobs = build_episode_jobs([TaskSpec('task')], capacity, 7, 'run')
+def test_rejection_replaces_layout_before_pending_jobs(phase, capacity,
+                                                       capsys):
+    jobs = build_episode_jobs([TaskSpec('task')], capacity + 1, 7, 'run')
     coordinator, slot, run = _coordinator_with_active_job(jobs[0])
-    slot.assignment = EpisodeAssignment(jobs)
+    coordinator.simulator_restart_limit = 0
+    slot.assignment = EpisodeAssignment(jobs[:capacity])
     state = coordinator._scheduling_state = _SchedulingState.from_jobs(jobs)
     state.pending_jobs.clear()
+    state.pending_jobs.append(jobs[-1])
     state.started_episode_ids.add(jobs[0].episode_id)
     coordinator._worker_router.incoming[1] = encode_header(
         'environment_case_rejected',
@@ -160,13 +163,13 @@ def test_rejection_phase_decides_layout_selection(phase, capacity):
     assert retry.episode_id == jobs[0].episode_id
     assert retry.policy_seed == jobs[0].policy_seed
     assert retry.environment_seed == jobs[0].environment_seed
-    expected_case = capacity if phase == 'reset' else 0
-    assert retry.environment_case_index == expected_case
+    assert retry.environment_case_index == capacity + 1
+    assert list(state.pending_jobs) == [retry, jobs[-1]]
     assert slot.completed_episode_ids == {jobs[0].episode_id}
     assert not slot.is_idle
-    assert state.restart_counts_by_episode_id == ({} if phase == 'reset' else {
-        jobs[0].episode_id: 1
-    })
+    assert state.restart_counts_by_episode_id == {}
+    assert state.results_by_episode_id == {}
+    assert f'during {phase}' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('phase', [None, 'unknown', True])
