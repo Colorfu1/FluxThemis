@@ -823,7 +823,8 @@ def _receive_event(coordinator,
                    job=None,
                    result=None,
                    assignment_id=None,
-                   generation=None):
+                   generation=None,
+                   phase=None):
     values = dict(
         deployment_id='deployment',
         worker_id=slot.worker_id,
@@ -831,6 +832,8 @@ def _receive_event(coordinator,
         assignment_id=assignment_id or slot.assignment.assignment_id)
     if job is not None:
         values['episode_id'] = job.episode_id
+    if phase is not None:
+        values['phase'] = phase
     coordinator._worker_router.incoming = [
         slot.routing_id,
         encode_header(kind, **values),
@@ -838,11 +841,13 @@ def _receive_event(coordinator,
     ]
 
 
-def test_duplicate_results_are_idempotent_and_conflicts_fail():
-    jobs = _jobs(2)
-    coordinator, slot = _coordinator(2, jobs)
+@pytest.mark.parametrize('capacity', [1, 3])
+@pytest.mark.parametrize('phase', [None, 'reset', 'step'])
+def test_terminal_episode_rejects_further_events(capacity, phase):
+    jobs = _jobs(capacity)
+    coordinator, slot = _coordinator(capacity, jobs)
     coordinator._dispatch_jobs()
-    env = MockVectorEnvironment(2, success_after=1)
+    env = MockVectorEnvironment(capacity, success_after=1)
     env.setup()
     results = execute_assignment(
         env, [MockPolicyClient() for _ in jobs],
@@ -854,29 +859,99 @@ def test_duplicate_results_are_idempotent_and_conflicts_fail():
     reporter = MockEvaluationReporter()
     with EvaluationRun(EvaluationSettings(), SuccessRateEvaluator(),
                        reporter) as run:
-        run.start([jobs[0].task], 2)
-        _receive_event(coordinator, slot, 'episode_start', job=jobs[0])
-        coordinator._receive_worker_message(run)
+        run.start([jobs[0].task], capacity)
+        if phase != 'reset':
+            _receive_event(coordinator, slot, 'episode_start', job=jobs[0])
+            coordinator._receive_worker_message(run)
         result = to_jsonable(results[0])
-        for _ in range(2):
+        if phase is None:
             _receive_event(
                 coordinator, slot, 'episode_end', job=jobs[0], result=result)
-            coordinator._receive_worker_message(run)
+        else:
+            _receive_event(
+                coordinator,
+                slot,
+                'environment_case_rejected',
+                job=jobs[0],
+                result={'reason': 'unstable layout'},
+                phase=phase)
+        coordinator._receive_worker_message(run)
+        state = coordinator._scheduling_state
+        pending = list(state.pending_jobs)
+        next_case = state.next_environment_case_index_by_task.copy()
+        for kind, payload in [('episode_start', None),
+                              ('environment_case_rejected', {
+                                  'reason': 'unstable layout'
+                              }), ('episode_end', result),
+                              ('episode_end', {
+                                  **result, 'success': False
+                              })]:
+            _receive_event(
+                coordinator,
+                slot,
+                kind,
+                job=jobs[0],
+                result=payload,
+                phase='step')
+            with pytest.raises(RuntimeError, match='unassigned episode'):
+                coordinator._receive_worker_message(run)
+        assert list(state.pending_jobs) == pending
+        assert state.next_environment_case_index_by_task == next_case
+        assert slot.completed_episode_ids == {jobs[0].episode_id}
         assert len([
             kind for kind, _ in reporter.events if kind == 'episode_end'
-        ]) == 1
-        assert len(coordinator._scheduling_state.results_by_episode_id) == 1
-        _receive_event(
-            coordinator,
+        ]) == int(phase is None)
+        assert len(state.results_by_episode_id) == int(phase is None)
+
+
+@pytest.mark.parametrize('capacity', [1, 3])
+def test_reconnected_worker_deduplicates_start_and_completes_retry(capacity):
+    jobs = _jobs(capacity)
+    coordinator, slot = _coordinator(capacity, jobs)
+    coordinator._dispatch_jobs()
+    reporter = MockEvaluationReporter()
+    with EvaluationRun(EvaluationSettings(), SuccessRateEvaluator(),
+                       reporter) as run:
+        run.start([jobs[0].task], capacity)
+        _receive_event(coordinator, slot, 'episode_start', job=jobs[0])
+        coordinator._receive_worker_message(run)
+        original_id = slot.assignment.assignment_id
+        coordinator._replace_worker_connection(
+            slot, routing_id=b'worker:1', generation=1)
+        coordinator._mark_worker_ready(
             slot,
-            'episode_end',
-            job=jobs[0],
-            result={
-                **result, 'success': False
-            })
-        with pytest.raises(RuntimeError, match='Conflicting duplicate'):
+            encode_frame({
+                'tasks': [to_jsonable(jobs[0].task)],
+                'capacity': capacity,
+            }))
+        coordinator._dispatch_jobs()
+        assert slot.assignment.assignment_id != original_id
+        env = MockVectorEnvironment(capacity, success_after=1)
+        env.setup()
+        results = execute_assignment(
+            env, [MockPolicyClient() for _ in jobs],
+            slot.assignment,
+            5,
+            None,
+            True,
+            execution_policy=slot.execution_policy)
+        for job, result in zip(slot.assignment.jobs, results):
+            _receive_event(coordinator, slot, 'episode_start', job=job)
             coordinator._receive_worker_message(run)
-        assert run.finish(results[0])['run']['completed_episodes'] == 1
+            _receive_event(
+                coordinator,
+                slot,
+                'episode_end',
+                job=job,
+                result=to_jsonable(result))
+            coordinator._receive_worker_message(run)
+        _receive_event(coordinator, slot, 'assignment_end')
+        coordinator._receive_worker_message(run)
+        assert slot.is_idle
+        assert len([
+            kind for kind, _ in reporter.events if kind == 'episode_start'
+        ]) == capacity
+        assert run.finish(results[-1])['run']['completed_episodes'] == capacity
 
 
 def test_old_assignment_and_generation_messages_cannot_complete_a_retry():

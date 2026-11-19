@@ -76,12 +76,20 @@ assignment 的总运行时间，包括 reset、模型推理、
 环境执行和录像收尾。增加 slot 数不会增加超时预算，完成一个 slot 也不会延长
 剩余 slot 的期限。选择容量时应为整组的串行模型请求预留时间。
 
-每次分配有独立的执行编号，旧进程或旧分配的迟到消息不影响新分配。同一次分配的
-重复结果只计一次；结果内容冲突会报错。结果先被 reporter 确认，才计入完成数。
+每次分配有独立的执行编号，旧进程或旧分配的迟到消息不影响新分配。同一次分配中，
+已结束或被拒的 episode 再上报开始、结果或拒绝事件，会作为协议错误报错。
+worker 重连后重跑未完成的 episode，开始事件仍按 episode ID 去重。
+结果先被 reporter 确认，才计入完成数。
 每个 slot 分别累计步数、成功状态、Score 和动作片段，结束后立即上报并收尾录像；
 整组结束后 worker 才接收下一组。episode ID 和 seed 按完整任务列表生成，
 不随 worker 数量或完成顺序变化。策略返回 `PolicyStop` 时只结束对应 slot，
 其余 slot 继续执行。策略自行声明完成的记录与环境判定的成功结果分别保存。
+
+`duration_s` 从 reset 和 policy client 初始化完成后开始计时，到该 episode 的
+录像等收尾完成为止，包含执行期间等待其他 slot 推理和处理的时间，不包含分配前
+排队和 reset；多个 slot 的计时会重叠，不能将其总和视为整个评测的墙钟耗时。
+比较并发配置时，应结合整段墙钟时间计算的吞吐率；纯模型推理耗时可按 episode
+汇总请求 profile 中的 `server_infer_s`，前提是模型服务提供了有效的计时。
 
 reset 或 step 阶段拒绝 case 时，coordinator 都为该 slot 分配未使用的 layout，
 优先补足被拒的 episode。被拒样本不计入成功、失败、Score 或 episode 耗时，

@@ -360,8 +360,6 @@ class DistributedEvaluationCoordinator:
                     'Worker ended assignment before all results')
             self._release_worker_slot(slot)
         elif message_type == 'episode_start':
-            if header.get('episode_id') in slot.completed_episode_ids:
-                return
             job = self._require_assigned_job(slot, header)
             if job.episode_id not in scheduling_state.started_episode_ids:
                 episode_start_payload = job.episode_start_payload(utc_now())
@@ -374,17 +372,12 @@ class DistributedEvaluationCoordinator:
                 scheduling_state.started_episode_ids.add(job.episode_id)
                 replacements.pop(job.episode_id, None)
         elif message_type == 'episode_end':
-            job = self._require_assigned_job(
-                slot, header, allow_completed=True)
+            job = self._require_assigned_job(slot, header)
             result = _episode_result_from_wire(decode_frame(payload))
             job.validate_result(result)
-            episode_id = _required_string(header, 'episode_id')
-            saved = scheduling_state.results_by_episode_id.get(episode_id)
-            if saved is not None:
-                if to_jsonable(saved) != to_jsonable(result):
-                    raise RuntimeError(
-                        f'Conflicting duplicate episode result {episode_id!r}')
-                return
+            if job.episode_id in scheduling_state.results_by_episode_id:
+                raise RuntimeError(
+                    f'duplicate episode result {job.episode_id!r}')
             if job.episode_id not in scheduling_state.started_episode_ids:
                 raise RuntimeError(
                     'Episode result received before episode start')
@@ -394,8 +387,6 @@ class DistributedEvaluationCoordinator:
             scheduling_state.results_by_episode_id[job.episode_id] = result
             slot.completed_episode_ids.add(job.episode_id)
         elif message_type == 'environment_case_rejected':
-            if header.get('episode_id') in slot.completed_episode_ids:
-                return
             job = self._require_assigned_job(slot, header)
             phase = header.get('phase')
             if phase not in ('reset', 'step'):
@@ -607,18 +598,14 @@ class DistributedEvaluationCoordinator:
         return (time.monotonic() + self.episode_timeout_s +
                 _SIMULATOR_RESTART_GRACE_S)
 
-    def _require_assigned_job(self,
-                              slot: _WorkerSlot,
-                              header: Mapping[str, Any],
-                              *,
-                              allow_completed: bool = False) -> EpisodeJob:
+    def _require_assigned_job(self, slot: _WorkerSlot,
+                              header: Mapping[str, Any]) -> EpisodeJob:
         episode_id = _required_string(header, 'episode_id')
         job = next(
             (job
              for job in slot.assignment.jobs if job.episode_id == episode_id),
             None) if slot.assignment else None
-        if (job is None or (not allow_completed
-                            and episode_id in slot.completed_episode_ids)):
+        if job is None or episode_id in slot.completed_episode_ids:
             raise RuntimeError(
                 f'worker {slot.worker_id} emitted an unassigned episode '
                 f'{episode_id!r}')
