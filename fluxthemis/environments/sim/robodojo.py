@@ -18,7 +18,8 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 from fluxthemis.engines.utils import ENVIRONMENTS
-from fluxthemis.structures import StepResult, TaskSpec, positive_integer
+from fluxthemis.structures import (EpisodeInterruption, StepResult, TaskSpec,
+                                   positive_integer)
 
 from ..base import BaseEnvironment, EnvironmentReset, EnvironmentResetRequest
 from .robodojo_log_capture import FileLogCapture
@@ -691,7 +692,7 @@ class RoboDojoEnvironment(BaseEnvironment):
         if not self._episode_active:
             return {}
         self._batch_inactive.add(slot)
-        if termination_reason == 'case_rejected':
+        if termination_reason in ('case_rejected', 'interrupted'):
             self._abort_video(slot)
             return {}
         if slot in self._video_finalized_slots:
@@ -705,7 +706,7 @@ class RoboDojoEnvironment(BaseEnvironment):
 
     def reset_batch(
         self, requests: list[EnvironmentResetRequest | None]
-    ) -> list[EnvironmentReset | None]:
+    ) -> list[EnvironmentReset | EpisodeInterruption | None]:
         if len(requests) != self.num_envs:
             raise ValueError('RoboDojo reset requires one entry per slot')
         active = [
@@ -742,15 +743,21 @@ class RoboDojoEnvironment(BaseEnvironment):
         self._batch_inactive = set(range(self._native_num_envs)) - set(active)
         self._video_finalized_slots = set(self._batch_inactive)
         rejected = set()
+        interrupted = set()
         try:
             self._env.reset(seed=layouts)
         except Exception as exc:
             if not _is_recoverable_robodojo_case_error(exc):
                 raise
             rejected.update(self._rejected_reset_slots(active, exc) or active)
+            # Native reset has not finished robot/reward initialization.
+            interrupted.update(active)
         rejected.update(self._rejected_reset_slots(active))
-        self._deactivate_rejected_slots(rejected)
-        healthy = [slot for slot in active if slot not in rejected]
+        interrupted.difference_update(rejected)
+        self._deactivate_slots(rejected | interrupted)
+        healthy = [
+            slot for slot in active if slot not in rejected | interrupted
+        ]
         by_slot = {}
         if healthy:
             self._env.run_reward()
@@ -769,6 +776,10 @@ class RoboDojoEnvironment(BaseEnvironment):
                 'layout_index': layouts[slot],
                 'environment_slot': slot,
             }
+            if slot in interrupted:
+                info['reason'] = 'RoboDojo reset was interrupted'
+                results[slot] = EpisodeInterruption(info)
+                continue
             if slot in rejected:
                 info['reason'] = 'RoboDojo initial layout is unstable'
                 results[slot] = EnvironmentReset(info=info, rejected=True)
@@ -792,7 +803,9 @@ class RoboDojoEnvironment(BaseEnvironment):
             if slot in unstable or (slot < len(end_flags) and end_flags[slot])
         ]
 
-    def step_batch(self, actions: list[Any | None]) -> list[StepResult | None]:
+    def step_batch(
+        self, actions: list[Any | None]
+    ) -> list[StepResult | EpisodeInterruption | None]:
         self._require_episode()
         if len(actions) != self.num_envs:
             raise ValueError('RoboDojo step requires one entry per slot')
@@ -816,19 +829,36 @@ class RoboDojoEnvironment(BaseEnvironment):
         # Finished lanes receive no control/reward updates. Native scenes have
         # separate objects and robots, isolating them from active episodes.
         unstable = set()
+        interrupted = set()
         try:
             self._env.take_action_batch(action_dicts, env_idx_list=active)
         except Exception as exc:
             if not _is_recoverable_robodojo_case_error(exc):
                 raise
             unstable.update(self._rejected_step_slots(active, exc) or active)
+            # No transition is valid when native control/reward work stops
+            # partway through the batch. Retry peers after closing/resetting.
+            interrupted.update(active)
         unstable.update(self._rejected_step_slots(active))
-        self._deactivate_rejected_slots(unstable)
-        observed = [slot for slot in active if slot not in unstable]
+        interrupted.difference_update(unstable)
+        self._deactivate_slots(unstable | interrupted)
+        observed = [
+            slot for slot in active if slot not in unstable | interrupted
+        ]
         by_slot, rejected_observations = self._observe_slots(observed, 'step')
         unstable.update(rejected_observations)
         for slot in active:
             request = self._batch_requests[slot]
+            if slot in interrupted:
+                results[slot] = EpisodeInterruption({
+                    'environment_case_index':
+                    request.environment_case_index,
+                    'environment_slot':
+                    slot,
+                    'reason':
+                    'RoboDojo did not finish executing the batch',
+                })
+                continue
             if slot in unstable:
                 results[slot] = StepResult(
                     observation={},
@@ -876,11 +906,11 @@ class RoboDojoEnvironment(BaseEnvironment):
             unstable.update(self._physx_monitor.get_broken_envs())
         return [slot for slot in active if slot in unstable]
 
-    def _deactivate_rejected_slots(self, slots: Iterable[int]) -> None:
+    def _deactivate_slots(self, slots: Iterable[int]) -> None:
         # Native observations check all live lanes for PhysX errors. Mask bad
         # lanes before observing their healthy peers, including after reset.
         end_flags = getattr(self._env, 'end_flag', ())
-        for slot in slots:
+        for slot in sorted(slots):
             self._batch_inactive.add(slot)
             if slot < len(end_flags):
                 end_flags[slot] = True
@@ -902,7 +932,7 @@ class RoboDojoEnvironment(BaseEnvironment):
                 # Each failed capture removes at least one slot. A native
                 # error without slot identities rejects the unobserved slots.
                 rejected.update(rejected_slots(remaining, exc) or remaining)
-                self._deactivate_rejected_slots(rejected)
+                self._deactivate_slots(rejected)
                 remaining = [
                     slot for slot in remaining if slot not in rejected
                 ]
@@ -911,7 +941,7 @@ class RoboDojoEnvironment(BaseEnvironment):
                 raise RuntimeError(
                     'RoboDojo returned an incomplete observation batch')
             rejected.update(rejected_slots(remaining))
-            self._deactivate_rejected_slots(rejected)
+            self._deactivate_slots(rejected)
             return dict(zip(remaining, observations)), rejected
         return {}, rejected
 

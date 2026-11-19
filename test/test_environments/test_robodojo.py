@@ -14,6 +14,7 @@ from fluxthemis.environments.sim import robodojo
 from fluxthemis.environments.sim.robodojo import RoboDojoEnvironment
 from fluxthemis.evaluators import SuccessRateEvaluator
 from fluxthemis.reporters import MockEvaluationReporter
+from fluxthemis.structures import EpisodeInterruption
 
 
 class UnStableError(RuntimeError):
@@ -37,27 +38,59 @@ class _BatchNativeEnvironment:
         self.unstable_envs = set()
         self.abort_calls = []
         self.video_calls = []
+        self.failure_at = None
+        self.failure_type = PhysXBrokenError
+        self.failure_slot = 0
+        self.initialized = False
+        self.pending_controls = []
+        self.step_reward_calls = 0
 
     def reset(self, seed):
         self.reset_calls.append(seed)
         self.end_flag = [value is None for value in seed]
         self.success = [True] * len(seed)
         self.take_action_cnt = [0] * len(seed)
+        self.pending_controls = [[] for _ in seed]
+        self.initialized = False
+        self._check_failure('reset')
+        self.initialized = True
 
     def close(self):
         self.close_calls += 1
+        self.pending_controls = []
+        self.initialized = False
+        self.unstable_envs.clear()
+
+    def _check_failure(self, stage):
+        if self.failure_at != stage:
+            return
+        self.failure_at = None
+        if self.failure_type is UnStableError:
+            self.unstable_envs.add(self.failure_slot)
+            self.end_flag[self.failure_slot] = True
+        raise self.failure_type({self.failure_slot})
 
     def run_reward(self):
+        assert self.initialized
         self.reward_calls += 1
 
     def get_obs_batch(self, env_idx_list):
+        assert self.initialized
         self.observation_calls.append(list(env_idx_list))
         return [{'slot': slot} for slot in env_idx_list]
 
     def take_action_batch(self, actions, env_idx_list):
+        assert self.initialized
+        self._check_failure('step_start')
         self.action_calls.append((actions, env_idx_list))
-        for slot in env_idx_list:
+        for action, slot in zip(actions, env_idx_list):
             self.take_action_cnt[slot] += 1
+            self.pending_controls[slot].extend([action] * 2)
+            self.pending_controls[slot].pop(0)
+        self._check_failure('step_mid')
+        for slot in env_idx_list:
+            self.pending_controls[slot].clear()
+        self.step_reward_calls += 1
         if 0 in env_idx_list:
             self.end_flag[0] = True
 
@@ -447,53 +480,35 @@ def test_runtime_invalid_layout_freezes_only_its_lane(batch_environment,
     ]
 
 
-@pytest.mark.parametrize('failure_at', ['reset', 'step', 'observation'])
-def test_physx_error_keeps_healthy_slots_observable(batch_environment,
-                                                    monkeypatch, failure_at):
+@pytest.mark.parametrize('phase', ['reset', 'step'])
+def test_observation_precheck_keeps_healthy_slots_observable(
+        batch_environment, monkeypatch, phase):
     env, native, requests = batch_environment
     rejected_slot = len(requests) - 1
+    observe = native.get_obs_batch
     broken = set()
     env._physx_monitor = SimpleNamespace(
         reset=broken.clear, get_broken_envs=lambda: set(broken))
-    original_reset = native.reset
-    original_step = native.take_action_batch
-    original_observe = native.get_obs_batch
 
-    def check_physics():
+    def check_then_observe(env_idx_list):
+        broken.add(rejected_slot)
+        # Native checks all live lanes before rendering, without changing
+        # control/reward state. Masking the bad lane makes capture safe.
         live = {slot for slot in broken if not native.end_flag[slot]}
         if live:
             raise PhysXBrokenError(live)
+        return observe(env_idx_list)
 
-    def reset(seed):
-        original_reset(seed)
-        if failure_at == 'reset':
-            broken.add(rejected_slot)
-
-    def step(actions, env_idx_list):
-        if failure_at == 'step':
-            broken.add(rejected_slot)
-        check_physics()
-        original_step(actions, env_idx_list)
-
-    def observe(env_idx_list):
-        if failure_at == 'observation' and native.action_calls:
-            broken.add(rejected_slot)
-        # RoboDojo checks every live lane, even when only peers are requested.
-        check_physics()
-        return original_observe(env_idx_list)
-
-    monkeypatch.setattr(native, 'reset', reset)
-    monkeypatch.setattr(native, 'take_action_batch', step)
-    monkeypatch.setattr(native, 'get_obs_batch', observe)
-    resets = env.reset_batch(requests)
-    if failure_at == 'reset':
-        assert [reset.rejected
-                for reset in resets] == ([False] * rejected_slot + [True])
-    else:
-        transitions = env.step_batch([1] * len(requests))
-        assert [result.case_rejected for result in transitions
-                ] == ([False] * rejected_slot + [True])
-    assert native.end_flag[rejected_slot]
+    if phase == 'step':
+        env.reset_batch(requests)
+    monkeypatch.setattr(native, 'get_obs_batch', check_then_observe)
+    results = (
+        env.reset_batch(requests)
+        if phase == 'reset' else env.step_batch([1] * len(requests)))
+    rejected = results[rejected_slot]
+    assert rejected.rejected if phase == 'reset' else rejected.case_rejected
+    assert all(not isinstance(result, EpisodeInterruption)
+               for result in results)
     assert native.abort_calls == [[rejected_slot]]
     transitions = env.step_batch(
         [None if flag else 1 for flag in native.end_flag])
@@ -502,24 +517,88 @@ def test_physx_error_keeps_healthy_slots_observable(batch_environment,
                if result is not None)
 
 
-def test_partial_native_reset_failure_keeps_healthy_slots(
-        batch_environment, monkeypatch):
+@pytest.mark.parametrize('failure_at', ['reset', 'step_start', 'step_mid'])
+@pytest.mark.parametrize('failure_type', [PhysXBrokenError, UnStableError])
+def test_interrupted_native_call_discards_all_unfinished_slots(
+        batch_environment, failure_at, failure_type):
     env, native, requests = batch_environment
-    reset = native.reset
-    rejected_slot = len(requests) - 1
+    capacity = len(requests)
+    if failure_at != 'reset':
+        env.reset_batch(requests)
+    native.failure_at = failure_at
+    native.failure_type = failure_type
+    native.failure_slot = capacity - 1
+    observations_before = list(native.observation_calls)
+    rewards_before = native.reward_calls
+    results = (
+        env.reset_batch(requests)
+        if failure_at == 'reset' else env.step_batch([1] * capacity))
+    assert len(results) == capacity
+    assert all(
+        isinstance(result, EpisodeInterruption) for result in results[:-1])
+    rejected = results[-1]
+    assert (rejected.rejected
+            if failure_at == 'reset' else rejected.case_rejected)
+    assert native.observation_calls == observations_before
+    assert native.reward_calls == rewards_before
+    assert native.step_reward_calls == 0
+    assert native.initialized == (failure_at != 'reset')
+    assert native.take_action_cnt == [int(failure_at == 'step_mid')] * capacity
+    assert [len(queue) for queue in native.pending_controls
+            ] == [int(failure_at == 'step_mid')] * capacity
+    assert native.abort_calls == [[slot] for slot in range(capacity)]
+    assert env._batch_inactive == set(range(capacity))
+    assert env._video_finalized_slots == set(range(capacity))
+    assert env.step_batch([None] * capacity) == [None] * capacity
+    with pytest.raises(ValueError, match='reactivate'):
+        env.step_batch([1] * capacity)
 
-    def unstable(seed):
-        reset(seed)
-        native.end_flag[rejected_slot] = True
-        raise UnStableError('partial reset')
-
-    monkeypatch.setattr(native, 'reset', unstable)
+    # The next attempt must rebuild the scene, including control queues and
+    # robot/reward initialization, before any actions are accepted.
     resets = env.reset_batch(requests)
-    assert [reset.rejected
-            for reset in resets] == [False] * rejected_slot + [True]
-    monkeypatch.setattr(native, 'reset', reset)
-    env.reset_batch(requests)
     assert native.close_calls == 1
+    assert native.initialized
+    assert native.pending_controls == [[] for _ in requests]
+    assert native.take_action_cnt == [0] * capacity
+    assert all(not reset.rejected for reset in resets)
+    assert not native.video_calls
+    assert all(not result.case_rejected
+               for result in env.step_batch([1] * capacity))
+
+
+def test_native_interruption_preserves_finished_and_unavailable_slots(
+        runtime_environment):
+    env, natives, _, _ = runtime_environment()
+    task = env.tasks()[1]
+    requests = [
+        EnvironmentResetRequest(task, slot, slot, slot) for slot in range(5)
+    ] + [None] * 3
+    env.reset_batch(requests)
+    native = natives[-1]
+    results = env.step_batch([1] * 5 + [None] * 3)
+    assert results[0].terminated and results[0].success
+    artifacts = env.finalize_episode(
+        0, success=True, termination_reason='success')
+    native.failure_at = 'step_mid'
+    native.failure_slot = 4
+    results = env.step_batch([None] + [1] * 4 + [None] * 3)
+    assert results[0] is None
+    assert all(
+        isinstance(result, EpisodeInterruption) for result in results[1:4])
+    assert results[4].case_rejected
+    assert results[5:] == [None] * 3
+    assert native.abort_calls == [[slot] for slot in range(1, 5)]
+    assert native.video_calls == [(0, 'success')]
+    assert env._video_finalized_slots == set(range(5))
+    assert all(
+        Path(path).read_bytes() == b'video'
+        for path in artifacts['video_paths'])
+    retries = [None, *requests[1:5], None, None, None]
+    env.reset_batch(retries)
+    assert native.close_calls == 1
+    assert native.pending_controls == [[] for _ in range(5)]
+    assert native.reset_calls[-1] == [None, 1, 2, 3, 4]
+    assert native.video_calls == [(0, 'success')]
 
 
 def test_rejection_during_initial_observation_is_slot_specific(

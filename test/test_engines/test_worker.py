@@ -14,9 +14,10 @@ from fluxthemis.engines.runners.coordinator import \
 from fluxthemis.engines.runners.evaluation import (EvaluationRun,
                                                    EvaluationSettings)
 from fluxthemis.engines.runners.resume import validate_journal
-from fluxthemis.environments import MockVectorEnvironment
+from fluxthemis.environments import EnvironmentReset, MockVectorEnvironment
 from fluxthemis.evaluators import SuccessRateEvaluator
 from fluxthemis.reporters import MockEvaluationReporter
+from fluxthemis.structures import EpisodeInterruption, StepResult
 
 
 class _ExecutionEnvironment(MockVectorEnvironment):
@@ -48,6 +49,8 @@ class _ExecutionEnvironment(MockVectorEnvironment):
                     for request in requests
                 ]) + '\n')
         results = super().reset_batch(requests)
+        if self._interrupts('reset'):
+            return self._discard_batch(requests, 'reset')
         for request, result in zip(requests, results):
             if request is not None and self._reject_at(request) == 'reset':
                 result.rejected = True
@@ -55,11 +58,31 @@ class _ExecutionEnvironment(MockVectorEnvironment):
         return results
 
     def step_batch(self, actions):
+        if self._interrupts('step'):
+            return self._discard_batch(actions, 'step')
         results = super().step_batch(actions)
         for request, result in zip(self.requests, results):
             if result is not None and self._reject_at(request) == 'step':
                 result.case_rejected = True
                 result.info['reason'] = 'broken physics'
+        return results
+
+    def _interrupts(self, phase):
+        return self.reject_phase == f'interrupt_{phase}' and any(
+            request is not None and request.environment_case_index == 0
+            for request in self.requests)
+
+    def _discard_batch(self, active, phase):
+        results = []
+        for request, value in zip(self.requests, active):
+            if value is None:
+                results.append(None)
+            elif request.environment_case_index == 0:
+                results.append(
+                    EnvironmentReset(rejected=True) if phase == 'reset' else
+                    StepResult(observation={}, case_rejected=True))
+            else:
+                results.append(EpisodeInterruption({'reason': 'partial call'}))
         return results
 
     def _reject_at(self, request):
@@ -88,7 +111,9 @@ def _mock_worker_process(**kwargs):
 
 
 @pytest.mark.parametrize('capacity', [1, 2, 3, 8])
-@pytest.mark.parametrize('reject_phase', [None, 'reset', 'step', 'mixed'])
+@pytest.mark.parametrize(
+    'reject_phase',
+    [None, 'reset', 'step', 'mixed', 'interrupt_reset', 'interrupt_step'])
 @pytest.mark.parametrize('requires_single_task', [False, True])
 def test_supervised_slot_execution(tmp_path, monkeypatch, capacity,
                                    reject_phase, requires_single_task):
@@ -147,9 +172,11 @@ def test_supervised_slot_execution(tmp_path, monkeypatch, capacity,
         payload for kind, payload in reporter.events if kind == 'episode_end'
     ]
     assert len({end['episode_id'] for end in ends}) == 5
+    interrupts = reject_phase in ('interrupt_reset', 'interrupt_step')
+    expected_cases = ([1, 2, 3, 4, 5] if interrupts else
+                      [1, 2, 3, 4, 7] if reject_phase else list(range(5)))
     assert sorted(end['environment_case_index']
-                  for end in ends) == ([1, 2, 3, 4, 7]
-                                       if reject_phase else list(range(5)))
+                  for end in ends) == expected_cases
     assert sorted(end['policy_seed'] for end in ends) == list(range(7, 12))
     assert all(end['success'] for end in ends)
     assert coordinator._scheduling_state.restart_counts_by_episode_id == {}
@@ -161,7 +188,25 @@ def test_supervised_slot_execution(tmp_path, monkeypatch, capacity,
         request[1] for batch in resets for request in batch
         if request is not None
     ]
-    assert sorted(cases) == list(range(8 if reject_phase else 5))
+    if interrupts:
+        # Only the faulty case gets a replacement. Peers repeat their exact
+        # case in the same process, ahead of jobs that were still pending.
+        assert sorted(cases) == sorted(
+            list(range(6)) + list(range(1, min(capacity, 5))))
+        for case in range(1, min(capacity, 5)):
+            attempts = [
+                request for batch in resets for request in batch
+                if request is not None and request[1] == case
+            ]
+            assert attempts[0] == attempts[1]
+        assert slot.generation == 0
+        starts = [
+            payload for kind, payload in reporter.events
+            if kind == 'episode_start'
+        ]
+        assert len(starts) == 5 + int(reject_phase == 'interrupt_step')
+    else:
+        assert sorted(cases) == list(range(8 if reject_phase else 5))
     rows = [
         dict(
             event_type=kind,

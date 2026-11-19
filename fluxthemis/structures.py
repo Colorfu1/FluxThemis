@@ -43,6 +43,17 @@ class TaskSpec:
         raise TypeError(f'Cannot create TaskSpec from {type(value).__name__}')
 
 
+@dataclass(frozen=True)
+class EpisodeInterruption:
+    """An unfinished attempt to retry with the same episode and initial case.
+
+    This is separate from a reset or step result: it carries no observation,
+    reward or outcome, and must not advance episode progress.
+    """
+
+    info: Mapping[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class StepResult:
     """One environment transition with explicit termination semantics."""

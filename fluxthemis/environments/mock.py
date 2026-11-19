@@ -5,7 +5,8 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from fluxthemis.engines.utils import ENVIRONMENTS
-from fluxthemis.structures import StepResult, TaskSpec, positive_integer
+from fluxthemis.structures import (EpisodeInterruption, StepResult, TaskSpec,
+                                   positive_integer)
 
 from .base import (BaseEnvironment, EnvironmentReset, EnvironmentResetRequest,
                    SingleEnvironmentAdapter)
@@ -112,7 +113,7 @@ class MockVectorEnvironment(BaseEnvironment):
 
     def reset_batch(
         self, requests: list[EnvironmentResetRequest | None]
-    ) -> list[EnvironmentReset | None]:
+    ) -> list[EnvironmentReset | EpisodeInterruption | None]:
         if len(requests) != self.num_envs:
             raise ValueError('Reset requests must fill all slots')
         return [
@@ -120,7 +121,9 @@ class MockVectorEnvironment(BaseEnvironment):
             for environment, request in zip(self.environments, requests)
         ]
 
-    def step_batch(self, actions: list[Any | None]) -> list[StepResult | None]:
+    def step_batch(
+        self, actions: list[Any | None]
+    ) -> list[StepResult | EpisodeInterruption | None]:
         if len(actions) != self.num_envs:
             raise ValueError('Actions must cover all slots')
         return [

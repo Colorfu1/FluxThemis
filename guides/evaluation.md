@@ -77,8 +77,9 @@ assignment 的总运行时间，包括 reset、模型推理、
 剩余 slot 的期限。选择容量时应为整组的串行模型请求预留时间。
 
 每次分配有独立的执行编号，旧进程或旧分配的迟到消息不影响新分配。同一次分配中，
-已结束或被拒的 episode 再上报开始、结果或拒绝事件，会作为协议错误报错。
-worker 重连后重跑未完成的 episode，开始事件仍按 episode ID 去重。
+已结束、被拒或中断的 episode 再上报开始、结果、拒绝或中断事件，会作为协议错误报错。
+worker 重连或场景中断后重跑未完成的 episode，开始事件仍由 worker 正常发送，
+coordinator 按 episode ID 去重；reset 尚未完成就中断的 episode 在重跑后首次上报开始。
 结果先被 reporter 确认，才计入完成数。
 每个 slot 分别累计步数、成功状态、Score 和动作片段，结束后立即上报并收尾录像；
 整组结束后 worker 才接收下一组。episode ID 和 seed 按完整任务列表生成，
@@ -94,7 +95,13 @@ worker 重连后重跑未完成的 episode，开始事件仍按 episode ID 去�
 reset 或 step 阶段拒绝 case 时，coordinator 都为该 slot 分配未使用的 layout，
 优先补足被拒的 episode。被拒样本不计入成功、失败、Score 或 episode 耗时，
 不消耗 `--simulator-restart-limit` 的进程重启预算，也没有额外的拒绝次数上限。
-phase 只用于日志。健康 slot 继续运行，被拒 slot 的录像单独丢弃。
+phase 只用于日志。被拒 slot 的录像单独丢弃。
+RoboDojo 原生调用正常返回的逐 slot 拒绝，以及取观测前检查发现的拒绝，允许健康
+slot 继续运行。如果原生 reset 或动作执行因可恢复异常中断，其他未完成 slot 的
+初始化或动作也可能只执行了一部分。这些 slot 标记为 interrupted，丢弃本次尝试及
+录像，原 job 使用相同 seed 和 layout 优先重跑；环境在重跑前关闭并重置原生场景，
+清空残留控制状态。中断尝试不计分、不计入 episode 耗时，也不消耗进程重启预算。
+已经完成的 episode 结果和录像保留。
 正常失败和达到步数上限仍是完成的评测结果。
 现有 `--resume` 流程可以重放已确认的结果，再执行剩余 episode。
 
@@ -103,7 +110,8 @@ phase 只用于日志。健康 slot 继续运行，被拒 slot 的录像单独�
 - `BaseEnvironment` 只要求 `num_envs`、`reset_batch(requests)`、
   `step_batch(actions)` 和 `finalize_episode(slot, ...)`；slot 必须显式传入。
   只实现 scalar reset/step 的旧环境继承 `SingleEnvironmentAdapter`，由它转换为
-  长度为 1 的 batch。LIBERO、RoboTwin、RoboCasa、Gymnasium 和 mock 已接入。
+  长度为 1 的 batch，并将原 scalar `render()` 改名为 `_render()`。
+  LIBERO、RoboTwin、RoboCasa、Gymnasium 和 mock 已接入。
 - reset 输入是长度为 `num_envs` 的列表，活动 slot 是 `EnvironmentResetRequest`，
   包含任务、episode index、环境 seed 和 case index。输出按 slot 返回
   `EnvironmentReset`，包含 observation、info 和 rejected；空 slot 的输入和输出
@@ -111,10 +119,14 @@ phase 只用于日志。健康 slot 继续运行，被拒 slot 的录像单独�
 - step 输入每 slot 一个动作，输出同长度的 `StepResult` 列表。使用
   `case_rejected` 标记拒绝；空闲或已结束 slot 的输入和输出都是 `None`。适配器
   负责冻结或隔离它们，不能影响健康 episode，也不得隐式 auto-reset。
+- reset 或 step 无法完成、但应保留原 case 重跑时，该 slot 返回
+  `EpisodeInterruption(info)`，不返回观测、reward 或普通结果。它与 rejected
+  互斥；适配器负责确保重跑前清理本次尝试留下的场景和控制状态。
 - 唯一执行入口是 `execute_assignment`。返回列表保留 slot 位置，被拒或未使用的
-  slot 为 `None`，其余为 `EpisodeResult`。
+  slot 以及中断的尝试为 `None`，其余为 `EpisodeResult`。
 - 每个 slot 单独结束或丢弃录像。通用录制器调用 `render(slot)`；原生录制器在
-  `finalize_episode(slot, ...)` 中收尾，并按 `case_rejected` 终止原因丢弃录像。
+  `finalize_episode(slot, ...)` 中收尾，并按 `case_rejected` 或 `interrupted`
+  终止原因丢弃录像。
 
 RoboDojo 在单 env 和多 env 下都通过原生 `reset`、`get_obs_batch` 和
 `take_action_batch` 执行，在一个 Isaac Sim 进程中加载独立 layout，通过 None

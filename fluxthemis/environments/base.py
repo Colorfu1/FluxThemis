@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from fluxthemis.structures import StepResult, TaskSpec
+from fluxthemis.structures import EpisodeInterruption, StepResult, TaskSpec
 
 
 @dataclass(frozen=True)
@@ -61,19 +61,22 @@ class BaseEnvironment(ABC):
     @abstractmethod
     def reset_batch(
         self, requests: list[EnvironmentResetRequest | None]
-    ) -> list[EnvironmentReset | None]:
-        """Reset requested slots, returning observations or rejections.
+    ) -> list[EnvironmentReset | EpisodeInterruption | None]:
+        """Reset slots, returning observations, rejections or interruptions.
 
         Both lists have num_envs entries in slot order. None marks an unused
         slot, which must remain inactive and return None.
         """
 
     @abstractmethod
-    def step_batch(self, actions: list[Any | None]) -> list[StepResult | None]:
+    def step_batch(
+        self, actions: list[Any | None]
+    ) -> list[StepResult | EpisodeInterruption | None]:
         """Advance active slots once, retaining their order.
 
         None marks an inactive slot; freeze or isolate it and return None.
-        Never auto-reset a slot. Each result may mark its case rejected.
+        Never auto-reset a slot. Reject invalid cases; return an interruption
+        when an unfinished attempt must restart with the same initial case.
         """
 
     def render(self, slot: int) -> Any | None:
@@ -92,7 +95,8 @@ class SingleEnvironmentAdapter(BaseEnvironment):
     """Bridge legacy scalar reset/step implementations to one batch slot.
 
     Scalar resets may return their existing (observation, info) tuple or an
-    EnvironmentReset rejection. All callers use the batch methods.
+    EnvironmentReset rejection or EpisodeInterruption. All callers use the
+    batch methods.
     """
 
     num_envs = 1
@@ -101,16 +105,16 @@ class SingleEnvironmentAdapter(BaseEnvironment):
     def reset(
         self, task: TaskSpec, episode_index: int, *,
         environment_seed: int | None, environment_case_index: int | None
-    ) -> tuple[Any, dict] | EnvironmentReset:
+    ) -> tuple[Any, dict] | EnvironmentReset | EpisodeInterruption:
         """Reset the legacy scalar environment."""
 
     @abstractmethod
-    def step(self, action: Any) -> StepResult:
+    def step(self, action: Any) -> StepResult | EpisodeInterruption:
         """Step the legacy scalar environment."""
 
     def reset_batch(
         self, requests: list[EnvironmentResetRequest | None]
-    ) -> list[EnvironmentReset | None]:
+    ) -> list[EnvironmentReset | EpisodeInterruption | None]:
         request, = requests
         if request is None:
             return [None]
@@ -119,11 +123,13 @@ class SingleEnvironmentAdapter(BaseEnvironment):
             request.episode_index,
             environment_seed=request.environment_seed,
             environment_case_index=request.environment_case_index)
-        if not isinstance(result, EnvironmentReset):
+        if not isinstance(result, (EnvironmentReset, EpisodeInterruption)):
             result = EnvironmentReset(*result)
         return [result]
 
-    def step_batch(self, actions: list[Any | None]) -> list[StepResult | None]:
+    def step_batch(
+        self, actions: list[Any | None]
+    ) -> list[StepResult | EpisodeInterruption | None]:
         action, = actions
         return [None if action is None else self.step(action)]
 

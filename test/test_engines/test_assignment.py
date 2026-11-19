@@ -18,7 +18,8 @@ from fluxthemis.environments import (EnvironmentReset, MockEnvironment,
 from fluxthemis.evaluators import SuccessRateEvaluator
 from fluxthemis.model_clients import MockPolicyClient
 from fluxthemis.reporters import MockEvaluationReporter
-from fluxthemis.structures import PolicyStop, StepResult, TaskSpec
+from fluxthemis.structures import (EpisodeInterruption, PolicyStop, StepResult,
+                                   TaskSpec)
 from fluxthemis.transports.zmq_protocol import (decode_frame, decode_header,
                                                 empty_payload, encode_frame,
                                                 encode_header)
@@ -302,6 +303,62 @@ def test_runtime_invalid_case_does_not_drop_healthy_progress(capacity):
     assert [client.call_count for client in clients] == [1] + [3] * (
         capacity - 1)
     assert environment.environments[0].step_count == 1
+
+
+@pytest.mark.parametrize('capacity', [1, 3])
+def test_interruption_keeps_completed_results_and_discards_attempt_metrics(
+        capacity):
+
+    class Environment(MockVectorEnvironment):
+
+        calls = 0
+
+        def step_batch(self, actions):
+            self.calls += 1
+            if self.calls == 2:
+                return [
+                    None if action is None else EpisodeInterruption()
+                    for action in actions
+                ]
+            return super().step_batch(actions)
+
+    environment = Environment(capacity, success_after=None)
+    for peer in environment.environments[:-1]:
+        peer.success_after = 1
+    environment.setup()
+    jobs = _jobs(capacity)
+    clients = [MockPolicyClient(chunk_size=1) for _ in jobs]
+    finished, interrupted = [], []
+    policy = ExecutionPolicy.from_environment(environment)
+    results = execute_assignment(
+        environment,
+        clients,
+        EpisodeAssignment(jobs),
+        2,
+        None,
+        True,
+        execution_policy=policy,
+        on_episode_finished=lambda job, result: finished.append(result),
+        on_episode_interrupted=lambda job, phase, info: interrupted.append(
+            (job, phase, info)))
+    assert finished == results[:-1]
+    assert all(result.steps == result.model_calls == 1 for result in finished)
+    assert results[-1] is None
+    assert interrupted == [(jobs[-1], 'step', {})]
+    assert [peer.step_count
+            for peer in environment.environments] == [1] * capacity
+    for peer in environment.environments:
+        peer.success_after = 1
+    retried = execute_assignment(
+        environment,
+        clients,
+        EpisodeAssignment(jobs[-1:]),
+        2,
+        None,
+        True,
+        execution_policy=policy)
+    assert retried[0].steps == retried[0].model_calls == 1
+    assert retried[1:] == [None] * (capacity - 1)
 
 
 @pytest.mark.parametrize('capacity', [1, 2])
@@ -842,8 +899,13 @@ def _receive_event(coordinator,
 
 
 @pytest.mark.parametrize('capacity', [1, 3])
-@pytest.mark.parametrize('phase', [None, 'reset', 'step'])
-def test_terminal_episode_rejects_further_events(capacity, phase):
+@pytest.mark.parametrize('event, phase',
+                         [('episode_end', None),
+                          ('environment_case_rejected', 'reset'),
+                          ('environment_case_rejected', 'step'),
+                          ('episode_interrupted', 'reset'),
+                          ('episode_interrupted', 'step')])
+def test_terminal_episode_rejects_further_events(capacity, event, phase):
     jobs = _jobs(capacity)
     coordinator, slot = _coordinator(capacity, jobs)
     coordinator._dispatch_jobs()
@@ -871,7 +933,7 @@ def test_terminal_episode_rejects_further_events(capacity, phase):
             _receive_event(
                 coordinator,
                 slot,
-                'environment_case_rejected',
+                event,
                 job=jobs[0],
                 result={'reason': 'unstable layout'},
                 phase=phase)
@@ -880,6 +942,7 @@ def test_terminal_episode_rejects_further_events(capacity, phase):
         pending = list(state.pending_jobs)
         next_case = state.next_environment_case_index_by_task.copy()
         for kind, payload in [('episode_start', None),
+                              ('episode_interrupted', {}),
                               ('environment_case_rejected', {
                                   'reason': 'unstable layout'
                               }), ('episode_end', result),
@@ -954,6 +1017,71 @@ def test_reconnected_worker_deduplicates_start_and_completes_retry(capacity):
         assert run.finish(results[-1])['run']['completed_episodes'] == capacity
 
 
+@pytest.mark.parametrize('capacity', [1, 3])
+@pytest.mark.parametrize('phase', ['reset', 'step'])
+def test_interruption_requeues_same_jobs_without_restart_or_duplicate_start(
+        capacity, phase):
+    jobs = _jobs(capacity + 1)
+    coordinator, slot = _coordinator(capacity, jobs)
+    coordinator.simulator_restart_limit = 0
+    coordinator._dispatch_jobs()
+    original = slot.assignment
+    state = coordinator._scheduling_state
+    next_cases = dict(state.next_environment_case_index_by_task)
+    reporter = MockEvaluationReporter()
+    with EvaluationRun(EvaluationSettings(), SuccessRateEvaluator(),
+                       reporter) as run:
+        run.start([jobs[0].task], len(jobs))
+        for job in original.jobs:
+            if phase == 'step':
+                _receive_event(coordinator, slot, 'episode_start', job=job)
+                coordinator._receive_worker_message(run)
+            _receive_event(
+                coordinator, slot, 'episode_interrupted', job=job, phase=phase)
+            coordinator._receive_worker_message(run)
+        assert slot.assignment is original
+        assert not slot.is_idle
+        assert list(state.pending_jobs) == [*reversed(original.jobs), jobs[-1]]
+        assert state.next_environment_case_index_by_task == next_cases
+        assert not state.replaced_cases_by_episode_id
+        assert not state.restart_counts_by_episode_id
+        assert not state.results_by_episode_id
+        _receive_event(coordinator, slot, 'assignment_end')
+        coordinator._receive_worker_message(run)
+        coordinator._dispatch_jobs()
+        assert slot.assignment.assignment_id != original.assignment_id
+        assert slot.generation == 0
+        assert slot.assignment.jobs == list(reversed(original.jobs))
+        env = MockVectorEnvironment(capacity, success_after=1)
+        env.setup()
+        results = execute_assignment(
+            env, [MockPolicyClient() for _ in range(capacity)],
+            slot.assignment,
+            2,
+            None,
+            True,
+            execution_policy=slot.execution_policy)
+        for job, result in zip(slot.assignment.jobs, results):
+            _receive_event(coordinator, slot, 'episode_start', job=job)
+            coordinator._receive_worker_message(run)
+            _receive_event(
+                coordinator,
+                slot,
+                'episode_end',
+                job=job,
+                result=to_jsonable(result))
+            coordinator._receive_worker_message(run)
+        _receive_event(coordinator, slot, 'assignment_end')
+        coordinator._receive_worker_message(run)
+        starts = [
+            body for kind, body in reporter.events if kind == 'episode_start'
+        ]
+        assert len(starts) == capacity
+        assert all('replaces_environment_case_index' not in body
+                   for body in starts)
+        assert run.finish(results[-1])['run']['completed_episodes'] == capacity
+
+
 def test_old_assignment_and_generation_messages_cannot_complete_a_retry():
     jobs = _jobs(2)
     coordinator, slot = _coordinator(2, jobs)
@@ -968,7 +1096,7 @@ def test_old_assignment_and_generation_messages_cannot_complete_a_retry():
     assert slot.assignment.assignment_id != original.assignment_id
     for kind in [
             'episode_start', 'episode_end', 'assignment_end',
-            'environment_case_rejected'
+            'environment_case_rejected', 'episode_interrupted'
     ]:
         _receive_event(
             coordinator,
@@ -1024,14 +1152,18 @@ def test_report_failure_does_not_commit_completion():
 
 
 @pytest.mark.parametrize('capacity', [1, 3])
-def test_reset_rejection_does_not_reset_or_infer_its_policy_client(capacity):
+@pytest.mark.parametrize('interrupted', [False, True])
+def test_discarded_reset_does_not_reset_or_infer_its_policy_client(
+        capacity, interrupted):
 
     class RejectedReset(MockVectorEnvironment):
 
         def reset_batch(self, requests):
             resets = super().reset_batch(requests)
-            resets[0] = EnvironmentReset(
-                rejected=True, info={'reason': 'unstable layout'})
+            info = {'reason': 'incomplete reset'}
+            resets[0] = (
+                EpisodeInterruption(info) if interrupted else EnvironmentReset(
+                    rejected=True, info=info))
             return resets
 
     class Client(MockPolicyClient):
@@ -1046,7 +1178,7 @@ def test_reset_rejection_does_not_reset_or_infer_its_policy_client(capacity):
     environment.setup()
     jobs = _jobs(capacity)
     clients = [Client() for _ in range(capacity)]
-    rejected, started = [], []
+    rejected, interruptions, started = [], [], []
     results = execute_assignment(
         environment,
         clients,
@@ -1057,8 +1189,12 @@ def test_reset_rejection_does_not_reset_or_infer_its_policy_client(capacity):
         execution_policy=ExecutionPolicy.from_environment(environment),
         on_case_rejected=lambda job, phase, info: rejected.append(
             (job, phase, info)),
+        on_episode_interrupted=lambda job, phase, info: interruptions.append(
+            (job, phase, info)),
         on_episode_started=started.append)
-    assert rejected == [(jobs[0], 'reset', {'reason': 'unstable layout'})]
+    expected = [(jobs[0], 'reset', {'reason': 'incomplete reset'})]
+    assert rejected == ([] if interrupted else expected)
+    assert interruptions == (expected if interrupted else [])
     assert started == jobs[1:]
     assert results[0] is None
     assert all(result.success for result in results[1:])
@@ -1069,7 +1205,9 @@ def test_reset_rejection_does_not_reset_or_infer_its_policy_client(capacity):
 
 
 @pytest.mark.parametrize('capacity', [1, 3])
-def test_rejected_slot_aborts_only_its_recorder(monkeypatch, capacity):
+@pytest.mark.parametrize('interrupted', [False, True])
+def test_discarded_slot_aborts_only_its_recorder(monkeypatch, capacity,
+                                                 interrupted):
     events = [[] for _ in range(capacity)]
 
     class Recorder:
@@ -1097,7 +1235,10 @@ def test_rejected_slot_aborts_only_its_recorder(monkeypatch, capacity):
         def step_batch(self, actions):
             results = super().step_batch(actions)
             if actions[0] is not None:
-                results[0].case_rejected = True
+                if interrupted:
+                    results[0] = EpisodeInterruption()
+                else:
+                    results[0].case_rejected = True
             return results
 
     monkeypatch.setattr(

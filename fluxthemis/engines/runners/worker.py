@@ -309,6 +309,17 @@ class _SimulatorWorker:
                     phase=phase,
                     payload=encode_frame(to_jsonable(info)))
 
+            def report_episode_interrupted(job: EpisodeJob, phase: str,
+                                           info: Mapping[str, Any]) -> None:
+                _send_episode_event(
+                    socket,
+                    self._message_identity,
+                    'episode_interrupted',
+                    job.episode_id,
+                    assignment_id=assignment.assignment_id,
+                    phase=phase,
+                    payload=encode_frame(to_jsonable(info)))
+
             execute_assignment(
                 environment=environment,
                 execution_policy=execution_policy,
@@ -321,6 +332,7 @@ class _SimulatorWorker:
                 on_episode_started=report_episode_start,
                 on_episode_finished=report_episode_end,
                 on_case_rejected=report_case_rejected,
+                on_episode_interrupted=report_episode_interrupted,
                 save_videos=save_videos,
                 video_dir=video_dir,
                 video_fps=video_fps,

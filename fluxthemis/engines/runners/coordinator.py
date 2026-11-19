@@ -386,11 +386,22 @@ class DistributedEvaluationCoordinator:
             evaluation_run.on_episode_end(result, job.episode_id)
             scheduling_state.results_by_episode_id[job.episode_id] = result
             slot.completed_episode_ids.add(job.episode_id)
-        elif message_type == 'environment_case_rejected':
+        elif message_type in ('environment_case_rejected',
+                              'episode_interrupted'):
             job = self._require_assigned_job(slot, header)
             phase = header.get('phase')
             if phase not in ('reset', 'step'):
-                raise ValueError('Case rejection phase must be reset or step')
+                raise ValueError('Episode discard phase must be reset or step')
+            if message_type == 'episode_interrupted':
+                scheduling_state.pending_jobs.appendleft(job)
+                slot.completed_episode_ids.add(job.episode_id)
+                print(
+                    f'[FluxThemis] simulator worker {slot.worker_id} '
+                    f'interrupted episode {job.episode_id} during {phase}; '
+                    f'retrying environment case {job.environment_case_index}',
+                    file=sys.stderr,
+                    flush=True)
+                return
             next_case_index = (
                 scheduling_state.next_environment_case_index_by_task.get(
                     job.task.task_id))

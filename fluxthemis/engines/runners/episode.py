@@ -18,8 +18,9 @@ import numpy as np
 from fluxthemis.environments.base import (BaseEnvironment, EnvironmentReset,
                                           EnvironmentResetRequest)
 from fluxthemis.model_clients.base import BasePolicyClient
-from fluxthemis.structures import (ActionChunk, EpisodeResult, PolicyStop,
-                                   StepResult, TaskSpec)
+from fluxthemis.structures import (ActionChunk, EpisodeInterruption,
+                                   EpisodeResult, PolicyStop, StepResult,
+                                   TaskSpec)
 
 from .assignment import EpisodeAssignment, ExecutionPolicy
 from .video import EpisodeVideoRecorder
@@ -280,13 +281,16 @@ def execute_assignment(
         on_case_rejected: (Callable[[EpisodeJob, str, Mapping[str, Any]], None]
                            | None) = None,
         *,
+        on_episode_interrupted: (Callable[[EpisodeJob, str, Mapping[str, Any]],
+                                          None] | None) = None,
         execution_policy: ExecutionPolicy) -> list[EpisodeResult | None]:
     """Advance one assignment with independent per-slot episode state.
 
     Policy requests remain per episode. All environment inputs and results
-    are lists in slot order; unused and rejected slots return None. Emit each
-    result when it finishes, keeping inactive slots frozen until the group
-    ends. Each slot owns its video recorder and rejection callback. Use the
+    are lists in slot order; unused and discarded attempts return None.
+    Emit each result when it finishes, keeping inactive slots frozen until
+    the group ends. Discard callbacks distinguish rejected cases from
+    interrupted attempts. Each slot owns its video recorder. Use the
     execution policy constructed after environment setup for all assignments.
     """
     execution_policy.validate_assignment(assignment, policy_clients)
@@ -305,19 +309,25 @@ def execute_assignment(
     recorders: list[EpisodeVideoRecorder
                     | None] = [None] * execution_policy.capacity
 
-    def reject_case(slot: int, job: EpisodeJob, phase: str,
-                    info: Mapping[str, Any]) -> None:
-        if not isinstance(info, Mapping):
-            raise TypeError('Environment rejection info must be a mapping')
+    def discard_episode(
+            slot: int, job: EpisodeJob, phase: str,
+            result: EnvironmentReset | StepResult | EpisodeInterruption
+    ) -> None:
+        if not isinstance(result.info, Mapping):
+            raise TypeError('Environment discard info must be a mapping')
+        if isinstance(result, EpisodeInterruption):
+            reason, callback = 'interrupted', on_episode_interrupted
+        else:
+            reason, callback = 'case_rejected', on_case_rejected
         recorder = recorders[slot]
         if recorder is not None:
             recorder.abort()
             recorders[slot] = None
         environment.finalize_episode(
-            slot, success=False, termination_reason='case_rejected')
+            slot, success=False, termination_reason=reason)
         states[slot] = None
-        if on_case_rejected is not None:
-            on_case_rejected(job, phase=phase, info=info)
+        if callback is not None:
+            callback(job, phase=phase, info=result.info)
 
     def finish_episode(slot: int, state: _EpisodeState) -> None:
         final_info = environment.finalize_episode(
@@ -352,13 +362,17 @@ def execute_assignment(
                     raise ValueError('Unused reset slots must return None')
                 continue
             job = jobs[slot]
+            if isinstance(reset, EpisodeInterruption):
+                discard_episode(slot, job, 'reset', reset)
+                continue
             if not isinstance(reset, EnvironmentReset):
                 raise TypeError(
-                    'Active reset slots must return an EnvironmentReset')
+                    'Active reset slots must return EnvironmentReset or '
+                    'EpisodeInterruption')
             if not isinstance(reset.info, Mapping):
                 raise TypeError('Environment reset info must be a mapping')
             if reset.rejected:
-                reject_case(slot, job, 'reset', reset.info)
+                discard_episode(slot, job, 'reset', reset)
                 continue
             client.reset(job.task, job.episode_index, job.policy_seed)
             client.set_episode_id(job.episode_id)
@@ -398,11 +412,15 @@ def execute_assignment(
                     if transition is not None:
                         raise ValueError('Inactive slots must return None')
                     continue
+                if isinstance(transition, EpisodeInterruption):
+                    discard_episode(slot, state.job, 'step', transition)
+                    continue
                 if not isinstance(transition, StepResult):
                     raise TypeError(
-                        'Active environment slot must return a StepResult')
+                        'Active environment slot must return StepResult or '
+                        'EpisodeInterruption')
                 if transition.case_rejected:
-                    reject_case(slot, state.job, 'step', transition.info)
+                    discard_episode(slot, state.job, 'step', transition)
                     continue
                 state.advance(transition, max_episode_steps, stop_on_success)
                 recorder = recorders[slot]
