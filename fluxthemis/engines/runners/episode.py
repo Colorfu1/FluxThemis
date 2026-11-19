@@ -264,31 +264,32 @@ class _EpisodeState:
 
 
 def execute_assignment(
-    environment: BaseEnvironment,
-    policy_clients: list[BasePolicyClient],
-    assignment: EpisodeAssignment,
-    max_episode_steps: int,
-    execute_horizon: int | None,
-    stop_on_success: bool,
-    on_episode_started: Callable[[EpisodeJob], None] | None = None,
-    on_episode_finished: (Callable[[EpisodeJob, EpisodeResult], None]
-                          | None) = None,
-    save_videos: bool = False,
-    video_dir: str | os.PathLike | None = None,
-    video_fps: int = 20,
-    video_worker_id: str | None = None,
-    on_case_rejected: Callable[[EpisodeJob, str, Mapping[str, Any]], None]
-    | None = None
-) -> list[EpisodeResult | None]:
+        environment: BaseEnvironment,
+        policy_clients: list[BasePolicyClient],
+        assignment: EpisodeAssignment,
+        max_episode_steps: int,
+        execute_horizon: int | None,
+        stop_on_success: bool,
+        on_episode_started: Callable[[EpisodeJob], None] | None = None,
+        on_episode_finished: (Callable[[EpisodeJob, EpisodeResult], None]
+                              | None) = None,
+        save_videos: bool = False,
+        video_dir: str | os.PathLike | None = None,
+        video_fps: int = 20,
+        video_worker_id: str | None = None,
+        on_case_rejected: (Callable[[EpisodeJob, str, Mapping[str, Any]], None]
+                           | None) = None,
+        *,
+        execution_policy: ExecutionPolicy) -> list[EpisodeResult | None]:
     """Advance one assignment with independent per-slot episode state.
 
     Policy requests remain per episode. All environment inputs and results
     are lists in slot order; unused and rejected slots return None. Emit each
     result when it finishes, keeping inactive slots frozen until the group
-    ends. Each slot owns its video recorder and rejection callback.
+    ends. Each slot owns its video recorder and rejection callback. Use the
+    execution policy constructed after environment setup for all assignments.
     """
-    policy = ExecutionPolicy.from_environment(environment)
-    policy.validate_assignment(assignment, policy_clients)
+    execution_policy.validate_assignment(assignment, policy_clients)
     if max_episode_steps < 1 or (execute_horizon is not None
                                  and execute_horizon < 1):
         raise ValueError(
@@ -299,9 +300,10 @@ def execute_assignment(
                                 job.environment_seed,
                                 job.environment_case_index) for job in jobs
     ]
-    requests.extend([None] * (policy.capacity - len(jobs)))
-    states: list[_EpisodeState | None] = [None] * policy.capacity
-    recorders: list[EpisodeVideoRecorder | None] = [None] * policy.capacity
+    requests.extend([None] * (execution_policy.capacity - len(jobs)))
+    states: list[_EpisodeState | None] = [None] * execution_policy.capacity
+    recorders: list[EpisodeVideoRecorder
+                    | None] = [None] * execution_policy.capacity
 
     def reject_case(slot: int, job: EpisodeJob, phase: str,
                     info: Mapping[str, Any]) -> None:
@@ -342,7 +344,7 @@ def execute_assignment(
 
     try:
         resets = environment.reset_batch(requests)
-        if len(resets) != policy.capacity:
+        if len(resets) != execution_policy.capacity:
             raise ValueError('reset_batch returned the wrong number of slots')
         for slot, (client, reset) in enumerate(zip(policy_clients, resets)):
             if slot >= len(jobs):
@@ -375,7 +377,7 @@ def execute_assignment(
                 recorder.capture(environment, slot)
         while any(state is not None and state.result is None
                   for state in states):
-            actions = [None] * policy.capacity
+            actions = [None] * execution_policy.capacity
             for slot, state in enumerate(states):
                 if state is None or state.result is not None:
                     continue
@@ -387,7 +389,7 @@ def execute_assignment(
             if not any(action is not None for action in actions):
                 continue
             transitions = environment.step_batch(actions)
-            if len(transitions) != policy.capacity:
+            if len(transitions) != execution_policy.capacity:
                 raise ValueError(
                     'step_batch returned the wrong number of slots')
             for slot, (state,

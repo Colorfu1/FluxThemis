@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 import yaml
 
-from fluxthemis.engines.runners.assignment import EpisodeAssignment
+from fluxthemis.engines.runners.assignment import (EpisodeAssignment,
+                                                   ExecutionPolicy)
 from fluxthemis.engines.runners.episode import (build_episode_jobs,
                                                 execute_assignment)
 from fluxthemis.environments import (EnvironmentResetRequest,
@@ -413,12 +414,22 @@ def test_execute_assignment(runtime):
         base_seed=7,
         run_session_id='robotwin')[0]
     policy = MockPolicyClient(action_dim=14, chunk_size=10)
-    result = execute_assignment(runtime, [policy], EpisodeAssignment([job]),
-                                2000, 10, True)[0]
+    result = execute_assignment(
+        runtime, [policy],
+        EpisodeAssignment([job]),
+        2000,
+        10,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(runtime))[0]
     assert result.success and result.steps == 3 and result.model_calls == 1
     runtime._env.failure = 'unstable'
-    assert execute_assignment(runtime, [policy], EpisodeAssignment([job]),
-                              2000, 10, True) == [None]
+    assert execute_assignment(
+        runtime, [policy],
+        EpisodeAssignment([job]),
+        2000,
+        10,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(runtime)) == [None]
 
 
 @pytest.mark.parametrize('save_video', [False, True])
@@ -465,6 +476,7 @@ def test_episode_observes_only_at_chunk_boundaries(runtime, monkeypatch,
         2000,
         10,
         True,
+        execution_policy=ExecutionPolicy.from_environment(runtime),
         save_videos=save_video,
         video_dir=tmp_path)[0]
     assert result.steps == 12 and result.model_calls == 2

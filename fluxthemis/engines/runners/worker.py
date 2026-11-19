@@ -176,12 +176,10 @@ class _SimulatorWorker:
                 evaluation_cfg)
             environment = build_environment_from_cfg(
                 evaluation_cfg['environment'])
-            policy = ExecutionPolicy(environment.num_envs,
-                                     environment.requires_single_task)
             environment.configure_worker(self.worker_id, self.deployment_id)
             environment.configure_simulator_device(self.device)
             environment.configure_video_recording(save_videos, video_dir)
-            for _ in range(policy.capacity):
+            for _ in range(environment.num_envs):
                 client = build_policy_client_from_cfg(
                     evaluation_cfg['policy_client'])
                 policy_clients.append(client)
@@ -210,6 +208,7 @@ class _SimulatorWorker:
                 self._execute_assignment(
                     socket=socket,
                     environment=environment,
+                    execution_policy=policy,
                     policy_clients=policy_clients,
                     evaluation_cfg=evaluation_cfg,
                     assignment=assignment,
@@ -273,6 +272,7 @@ class _SimulatorWorker:
         return assignment
 
     def _execute_assignment(self, *, socket: Any, environment: BaseEnvironment,
+                            execution_policy: ExecutionPolicy,
                             policy_clients: list[BasePolicyClient],
                             evaluation_cfg: Mapping[str, Any],
                             assignment: EpisodeAssignment, save_videos: bool,
@@ -311,6 +311,7 @@ class _SimulatorWorker:
 
             execute_assignment(
                 environment=environment,
+                execution_policy=execution_policy,
                 policy_clients=policy_clients,
                 assignment=assignment,
                 max_episode_steps=int(evaluation_cfg['max_episode_steps']),

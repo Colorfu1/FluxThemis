@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from fluxthemis.engines.runners.assignment import EpisodeAssignment
+from fluxthemis.engines.runners.assignment import (EpisodeAssignment,
+                                                   ExecutionPolicy)
 from fluxthemis.engines.runners.episode import (build_episode_jobs,
                                                 execute_assignment,
                                                 validate_action_chunk)
@@ -18,9 +19,16 @@ def test_episode_jobs_and_execution_contract(capacity):
     assert [job.environment_case_index for job in jobs] == [0, 1, 0, 1]
     environment = MockVectorEnvironment(capacity, success_after=2)
     environment.setup()
-    results = execute_assignment(environment, [
-        MockPolicyClient(action_dim=7, chunk_size=1) for _ in range(capacity)
-    ], EpisodeAssignment(jobs[:capacity]), 3, 1, True)
+    results = execute_assignment(
+        environment, [
+            MockPolicyClient(action_dim=7, chunk_size=1)
+            for _ in range(capacity)
+        ],
+        EpisodeAssignment(jobs[:capacity]),
+        3,
+        1,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(environment))
     for job, result in zip(jobs, results):
         job.validate_result(result)
         assert result.success and result.steps == 2

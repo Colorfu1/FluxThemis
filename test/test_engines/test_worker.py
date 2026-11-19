@@ -28,11 +28,14 @@ class _ExecutionEnvironment(MockVectorEnvironment):
         self.reject_phase = reject_phase
         self.requires_single_task = requires_single_task
         self.task_capacities = task_capacities
+        self.read_task_capacities = set()
         for index, environment in enumerate(self.environments):
             environment.success_after = index * 2 + 1
 
     def task_capacity(self, task):
         assert all(environment.is_setup for environment in self.environments)
+        assert task.task_id not in self.read_task_capacities
+        self.read_task_capacities.add(task.task_id)
         return self.task_capacities.get(task.task_id, self.num_envs)
 
     def reset_batch(self, requests):

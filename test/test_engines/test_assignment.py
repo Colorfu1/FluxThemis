@@ -47,6 +47,7 @@ def test_shared_execution_preserves_slot_identity_and_chunk_progress(capacity):
         10,
         None,
         True,
+        execution_policy=ExecutionPolicy.from_environment(environment),
         on_episode_finished=lambda job, result: completed.append(job.episode_id
                                                                  ))
     assert completed == [job.episode_id for job in jobs]
@@ -69,7 +70,11 @@ def test_horizon_and_max_steps_apply_per_slot():
     environment.setup()
     results = execute_assignment(
         environment, [MockPolicyClient(chunk_size=8) for _ in range(2)],
-        EpisodeAssignment(_jobs(2)), 5, 2, True)
+        EpisodeAssignment(_jobs(2)),
+        5,
+        2,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(environment))
     assert [r.steps for r in results] == [2, 5]
     assert [r.model_calls for r in results] == [1, 3]
     assert [r.termination_reason
@@ -108,6 +113,7 @@ def test_policy_completion_without_actions_finalizes_each_slot(capacity):
         10,
         None,
         True,
+        execution_policy=ExecutionPolicy.from_environment(environment),
         on_episode_finished=lambda job, result: completed.append(result))
     assert finalized == [(slot, False, 'policy_completed')
                          for slot in range(capacity)]
@@ -158,9 +164,13 @@ def test_policy_stop_keeps_peer_running_and_uses_executed_step_counts():
     environment = Environment(2, success_after=None, max_internal_steps=20)
     environment.environments[1].success_after = 6
     environment.setup()
-    results = execute_assignment(environment,
-                                 [Client(), MockPolicyClient()],
-                                 EpisodeAssignment(_jobs(2)), 10, 2, True)
+    results = execute_assignment(
+        environment, [Client(), MockPolicyClient()],
+        EpisodeAssignment(_jobs(2)),
+        10,
+        2,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(environment))
     assert observation_ids == [0, 2, 4]
     assert [slot.step_count for slot in environment.environments] == [4, 6]
     assert [result.steps for result in results] == [4, 6]
@@ -187,10 +197,13 @@ def test_finalization_always_receives_its_slot(capacity):
         return {'artifact': f'slot-{slot}'}
 
     environment.finalize_episode = finalize_episode
-    results = execute_assignment(environment,
-                                 [MockPolicyClient() for _ in range(capacity)],
-                                 EpisodeAssignment(_jobs(capacity)), 10, None,
-                                 True)
+    results = execute_assignment(
+        environment, [MockPolicyClient() for _ in range(capacity)],
+        EpisodeAssignment(_jobs(capacity)),
+        10,
+        None,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(environment))
     assert finalized == [(slot, True, 'success') for slot in range(capacity)]
     assert [result.info['artifact'] for result in results
             ] == [f'slot-{slot}' for slot in range(capacity)]
@@ -212,10 +225,13 @@ def test_score_validation_and_sticky_success_are_shared(capacity):
 
     environment = Environment(capacity, success_after=None)
     environment.setup()
-    results = execute_assignment(environment,
-                                 [MockPolicyClient() for _ in range(capacity)],
-                                 EpisodeAssignment(_jobs(capacity)), 10, None,
-                                 False)
+    results = execute_assignment(
+        environment, [MockPolicyClient() for _ in range(capacity)],
+        EpisodeAssignment(_jobs(capacity)),
+        10,
+        None,
+        False,
+        execution_policy=ExecutionPolicy.from_environment(environment))
     assert all(r.success and r.steps == 3 and r.score == 0.75 for r in results)
     assert all(r.termination_reason == 'terminated' for r in results)
 
@@ -241,6 +257,7 @@ def test_partial_results_survive_later_slot_failure():
             10,
             None,
             True,
+            execution_policy=ExecutionPolicy.from_environment(environment),
             on_episode_finished=lambda job, result: results.append(result))
     assert len(results) == 1
     assert results[0].episode_index == 0
@@ -270,6 +287,7 @@ def test_runtime_invalid_case_does_not_drop_healthy_progress(capacity):
         10,
         None,
         True,
+        execution_policy=ExecutionPolicy.from_environment(environment),
         on_case_rejected=lambda job, phase, info: rejected.append(
             (job.episode_id, phase, info)),
         on_episode_finished=lambda job, result: completed.append(job.episode_id
@@ -299,9 +317,13 @@ def test_nonfinite_score_is_rejected(capacity):
     environment = BadScore(capacity)
     environment.setup()
     with pytest.raises(ValueError, match='non-finite'):
-        execute_assignment(environment,
-                           [MockPolicyClient() for _ in range(capacity)],
-                           EpisodeAssignment(_jobs(capacity)), 10, None, True)
+        execute_assignment(
+            environment, [MockPolicyClient() for _ in range(capacity)],
+            EpisodeAssignment(_jobs(capacity)),
+            10,
+            None,
+            True,
+            execution_policy=ExecutionPolicy.from_environment(environment))
 
 
 @pytest.mark.parametrize('value', [0, -1, True, 1.5])
@@ -350,7 +372,8 @@ def test_assignment_respects_task_limit_with_full_worker_client_container():
         policy.validate_assignment(EpisodeAssignment(jobs[:5]), clients[:5])
     assert policy.task_capacity(TaskSpec('unlimited')) == 8
     assert policy.task_capacity(TaskSpec('full')) == 8
-    policy.validate_capacity(8, {'limited': 5, 'full': 8})
+    assert policy.task_capacities == {'limited': 5}
+    policy.validate_capacity(8, {'limited': 5})
 
 
 @pytest.mark.parametrize('limit', [0, -1, True, 1.5, None])
@@ -366,24 +389,68 @@ def test_task_capacity_cannot_exceed_worker_capacity():
         ExecutionPolicy(8, task_capacities={'task': 9})
 
 
-def test_execute_assignment_reads_capacity_from_environment(monkeypatch):
-    environment = MockVectorEnvironment(8, tasks=['limited'], success_after=1)
+@pytest.mark.parametrize('limit', [0, -1, True, 8.0, 9.0, 9, None])
+def test_environment_task_capacities_are_validated_before_filtering(
+        monkeypatch, limit):
+    environment = MockVectorEnvironment(8)
+    environment.setup()
+    monkeypatch.setattr(environment, 'task_capacity', lambda task: limit)
+    with pytest.raises(ValueError, match='[Tt]ask capacity'):
+        ExecutionPolicy.from_environment(environment)
+
+
+@pytest.mark.parametrize('capacity', [1, 8])
+def test_execute_assignment_reuses_declared_capabilities(
+        monkeypatch, capacity):
+    limit = min(capacity, 5)
+    environment = MockVectorEnvironment(
+        capacity, tasks=['limited'], success_after=1)
     environment.setup()
     monkeypatch.setattr(environment, 'tasks', lambda: ['limited'])
     monkeypatch.setattr(environment, 'task_capacity',
-                        lambda task: {'limited': 5}[task.task_id])
-    jobs = _jobs(6, ('limited', ))
-    clients = [MockPolicyClient() for _ in range(8)]
-    with pytest.raises(ValueError, match='task slot limit'):
-        execute_assignment(environment, clients, EpisodeAssignment(jobs), 2,
-                           None, True)
+                        lambda task: {'limited': limit}[task.task_id])
+    policy = ExecutionPolicy.from_environment(environment)
+
+    def read_capabilities_again(*args):
+        raise AssertionError('Capabilities must only be read during setup')
+
+    monkeypatch.setattr(environment, 'tasks', read_capabilities_again)
+    monkeypatch.setattr(environment, 'task_capacity', read_capabilities_again)
+    jobs = _jobs(limit + 1, ('limited', ))
+    clients = [MockPolicyClient() for _ in range(capacity)]
+    with pytest.raises(ValueError, match='exceeds'):
+        execute_assignment(
+            environment,
+            clients,
+            EpisodeAssignment(jobs),
+            2,
+            None,
+            True,
+            execution_policy=policy)
     assert all(slot.current_task is None for slot in environment.environments)
-    results = execute_assignment(environment, clients,
-                                 EpisodeAssignment(jobs[:5]), 2, None, True)
-    assert len(results) == 8
-    assert results[5:] == [None] * 3
-    assert all(result.success for result in results[:5])
-    assert [client.call_count for client in clients] == [1] * 5 + [0] * 3
+    results = execute_assignment(
+        environment,
+        clients,
+        EpisodeAssignment(jobs[:limit]),
+        2,
+        None,
+        True,
+        execution_policy=policy)
+    assert len(results) == capacity
+    assert results[limit:] == [None] * (capacity - limit)
+    assert all(result.success for result in results[:limit])
+    assert [client.call_count for client in clients] == [1] * limit + [0] * (
+        capacity - limit)
+    results = execute_assignment(
+        environment,
+        clients,
+        EpisodeAssignment(jobs[-1:]),
+        2,
+        None,
+        True,
+        execution_policy=policy)
+    assert results[0].success
+    assert results[1:] == [None] * (capacity - 1)
 
 
 class _Socket:
@@ -515,6 +582,7 @@ def test_worker_coordinator_roundtrip_waits_for_assignment_end(
             worker._execute_assignment(
                 socket=socket,
                 environment=environment,
+                execution_policy=slot.execution_policy,
                 policy_clients=[MockPolicyClient() for _ in range(capacity)],
                 evaluation_cfg={'max_episode_steps': 10},
                 assignment=assignment,
@@ -632,7 +700,11 @@ def test_scalar_environment_does_not_silently_run_a_batch():
         execute_assignment(
             environment,
             [MockPolicyClient(), MockPolicyClient()],
-            EpisodeAssignment(_jobs(2)), 10, None, True)
+            EpisodeAssignment(_jobs(2)),
+            10,
+            None,
+            True,
+            execution_policy=ExecutionPolicy.from_environment(environment))
 
 
 @pytest.mark.parametrize('capacity', [1, 3])
@@ -682,6 +754,7 @@ def test_video_finishes_or_aborts_each_slot(monkeypatch, capacity, fail):
             10,
             None,
             True,
+            execution_policy=ExecutionPolicy.from_environment(environment),
             save_videos=True,
             video_dir='/unused')
 
@@ -727,8 +800,14 @@ def test_unused_slots_do_not_reset_or_infer(capacity):
     environment = MockVectorEnvironment(capacity, success_after=1)
     environment.setup()
     clients = [MockPolicyClient() for _ in range(capacity)]
-    results = execute_assignment(environment, clients,
-                                 EpisodeAssignment(_jobs(1)), 5, None, True)
+    results = execute_assignment(
+        environment,
+        clients,
+        EpisodeAssignment(_jobs(1)),
+        5,
+        None,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(environment))
     assert len(results) == capacity
     assert results[1:] == [None] * (capacity - 1)
     assert [client.call_count for client in clients] == [1] + [0] * (
@@ -765,8 +844,13 @@ def test_duplicate_results_are_idempotent_and_conflicts_fail():
     coordinator._dispatch_jobs()
     env = MockVectorEnvironment(2, success_after=1)
     env.setup()
-    results = execute_assignment(env, [MockPolicyClient() for _ in jobs],
-                                 slot.assignment, 5, None, True)
+    results = execute_assignment(
+        env, [MockPolicyClient() for _ in jobs],
+        slot.assignment,
+        5,
+        None,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(env))
     reporter = MockEvaluationReporter()
     with EvaluationRun(EvaluationSettings(), SuccessRateEvaluator(),
                        reporter) as run:
@@ -840,8 +924,12 @@ def test_report_failure_does_not_commit_completion():
     env = MockVectorEnvironment(2, success_after=1)
     env.setup()
     result = execute_assignment(
-        env, [MockPolicyClient(), MockPolicyClient()], slot.assignment, 5,
-        None, True)[0]
+        env, [MockPolicyClient(), MockPolicyClient()],
+        slot.assignment,
+        5,
+        None,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(env))[0]
     with EvaluationRun(EvaluationSettings(), SuccessRateEvaluator(),
                        Reporter()) as run:
         run.start([jobs[0].task], 1)
@@ -891,6 +979,7 @@ def test_reset_rejection_does_not_reset_or_infer_its_policy_client(capacity):
         5,
         None,
         True,
+        execution_policy=ExecutionPolicy.from_environment(environment),
         on_case_rejected=lambda job, phase, info: rejected.append(
             (job, phase, info)),
         on_episode_started=started.append)
@@ -946,6 +1035,7 @@ def test_rejected_slot_aborts_only_its_recorder(monkeypatch, capacity):
         5,
         None,
         True,
+        execution_policy=ExecutionPolicy.from_environment(environment),
         save_videos=True,
         video_dir='/unused')
     assert results[0] is None

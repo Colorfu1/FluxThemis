@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 from mmengine import Config
 
-from fluxthemis.engines.runners.assignment import EpisodeAssignment
+from fluxthemis.engines.runners.assignment import (EpisodeAssignment,
+                                                   ExecutionPolicy)
 from fluxthemis.engines.runners.episode import (build_episode_jobs,
                                                 execute_assignment)
 from fluxthemis.engines.runners.evaluation import (EvaluationRun,
@@ -127,6 +128,7 @@ def test_prepare_resume_preserves_slot_results(tmp_path, capacity, resume):
             5,
             None,
             True,
+            execution_policy=ExecutionPolicy.from_environment(environment),
             on_episode_started=lambda job: run.on_episode_start(
                 job.episode_start_payload(utc_now())))[0]
         run.on_episode_end(result, jobs[0].episode_id)

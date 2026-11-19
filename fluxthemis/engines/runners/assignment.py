@@ -44,11 +44,17 @@ class ExecutionPolicy:
         positive_integer(self.capacity, 'capacity')
         if type(self.requires_single_task) is not bool:
             raise TypeError('requires_single_task must be a boolean')
-        object.__setattr__(self, 'task_capacities', dict(self.task_capacities))
-        for capacity in self.task_capacities.values():
+        task_capacities = dict(self.task_capacities)
+        for capacity in task_capacities.values():
             positive_integer(capacity, 'task capacity')
             if capacity > self.capacity:
                 raise ValueError('Task capacity exceeds worker capacity')
+        object.__setattr__(
+            self, 'task_capacities', {
+                task_id: capacity
+                for task_id, capacity in task_capacities.items()
+                if capacity < self.capacity
+            })
 
     @classmethod
     def from_environment(cls, environment: BaseEnvironment) -> ExecutionPolicy:
@@ -56,9 +62,7 @@ class ExecutionPolicy:
         task_capacities = {}
         for value in environment.tasks():
             task = TaskSpec.from_value(value)
-            capacity = environment.task_capacity(task)
-            if capacity < environment.num_envs:
-                task_capacities[task.task_id] = capacity
+            task_capacities[task.task_id] = environment.task_capacity(task)
         return cls(environment.num_envs, environment.requires_single_task,
                    task_capacities)
 
