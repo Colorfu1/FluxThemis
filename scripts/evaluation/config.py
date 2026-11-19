@@ -162,6 +162,9 @@ def load_config(path, *, mode=None, overrides=None):
         restart_limit = 0 if is_robolab else 3
     integer(restart_limit, 'simulator.simulator_restart_limit', minimum=0)
     integer(sim['episode_timeout_s'], 'simulator.episode_timeout_s')
+    episode_timeout_s = overrides.get('episode_timeout_s')
+    if episode_timeout_s is None:
+        episode_timeout_s = sim['episode_timeout_s']
     if is_robolab:
         if (isinstance(environment.get('num_envs', 1), bool)
                 or not isinstance(environment.get('num_envs', 1), int)
@@ -326,7 +329,7 @@ def load_config(path, *, mode=None, overrides=None):
         robotwin_root=robotwin_root,
         robolab_root=robolab_root,
         simulator_restart_limit=restart_limit,
-        episode_timeout_s=sim['episode_timeout_s'],
+        episode_timeout_s=episode_timeout_s,
         assets=assets,
         cache=path_value(sim['cache'], 'simulator.cache', path.parent)
         if sim['cache'] else None,

@@ -81,6 +81,55 @@ def test_launcher_accepts_batch_configuration(tmp_path, dry_run):
         assert not (output / 'simulator.log').exists()
 
 
+@pytest.mark.parametrize('config_format', ['py', 'yaml'])
+@pytest.mark.parametrize('timeout_s', [None, 7200.5])
+def test_launcher_forwards_assignment_timeout(tmp_path, monkeypatch,
+                                              config_format, timeout_s):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    launcher = importlib.import_module('run_evaluation')
+    distributed = importlib.import_module('distributed_eval')
+    config = tmp_path / 'evaluation.py'
+    _config(8).dump(str(config))
+    if config_format == 'yaml':
+        config = tmp_path / 'launch.yaml'
+        config.write_text('simulator:\n  config: evaluation.py\n')
+    pointer = tmp_path / 'result_pointer.json'
+    command = [
+        'bash',
+        str(ROOT / 'scripts/run_evaluation.sh'), '--config',
+        str(config), '--dry-run', '--gpu-ids', '0', '--output',
+        str(tmp_path / 'output'), '--result-pointer',
+        str(pointer)
+    ]
+    if timeout_s is not None:
+        command += ['--episode-timeout-s', str(timeout_s)]
+    env = dict(
+        os.environ, PYTHONPATH=str(ROOT), FLUXTHEMIS_PYTHON=sys.executable)
+    env.pop('CUDA_VISIBLE_DEVICES', None)
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    output = Path(json.loads(pointer.read_text())['directory'])
+    plan = json.loads((output / 'plan.json').read_text())
+    assert plan['episode_timeout_s'] == timeout_s
+    arguments = launcher.simulator_arguments(plan)
+    timeout_arguments = []
+    assert ('--episode-timeout-s' in arguments) == (timeout_s is not None)
+    if timeout_s is not None:
+        index = arguments.index('--episode-timeout-s')
+        timeout_arguments = arguments[index:index + 2]
+    parsed = distributed.parse_args(
+        ['--config', plan['local']['frozen_config'], *timeout_arguments])
+    assert parsed.episode_timeout_s == (3600.0
+                                        if timeout_s is None else timeout_s)
+    assert not (output / 'simulator.log').exists()
+
+
 @pytest.mark.parametrize('capacity', [None, 1, 3])
 def test_smoke_episode_count_uses_environment_capacity(monkeypatch, capacity):
     monkeypatch.syspath_prepend(str(ROOT / 'scripts'))

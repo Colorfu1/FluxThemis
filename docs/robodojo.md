@@ -58,15 +58,6 @@ See the config for quotas and the [environment task groups](../fluxthemis/enviro
 for case-sensitive task IDs. Unstable layouts are replaced with spare layouts,
 so available layouts may need to exceed the accepted episode quota.
 
-Multiple RoboDojo scenes can share one simulator worker. Set
-`themis.evaluation.environment.num_envs` in the evaluation config. Each
-assignment contains episodes of one task, and `episode_timeout_s` covers the
-whole assignment, so raise it with `num_envs`. As in native RoboDojo
-evaluation, `_random` tasks use at most `sim.scene.clutter_env_limit` scenes
-(5 by default); larger capacities apply to other tasks. See
-[multiple environments per simulator](../guides/evaluation.md#单个模拟器的多个环境)
-for scheduling, case rejection and video behavior.
-
 The default config uses three cameras, 14D joint actions, `base_seed=0`, at most
 2,000 action steps per episode and up to 50 actions per prediction. Policy seeds
 and task-local layout indexes are separate. VPP2 uses the
@@ -95,7 +86,7 @@ bash scripts/run_evaluation.sh \
   --output ./work_dirs/robodojo
 ```
 
-`--smoke` runs `put_bottles_into_dustbin`, one episode per simulator worker.
+`--smoke` runs `put_bottles_into_dustbin`, one episode per scene.
 Replace it with `--full` to use all tasks and their configured quotas. Start a
 fresh model service between runs: FluxVLA exits after an accepted `run_end`.
 Add `--dry-run` to inspect the resolved config without starting workloads;
@@ -110,6 +101,15 @@ scheduling requires equal counts. See [network and scheduling details](../guides
 This launcher supports one simulator host with multiple GPUs. For multiple
 simulator nodes, use `distributed_eval.sh` as described in the
 [README](../README.md#multi-node-evaluation).
+
+### Multiple Scenes per Worker
+
+Set `themis.evaluation.environment.num_envs` to run several scenes of one task
+per worker; `_random` tasks are capped by RoboDojo's
+`sim.scene.clutter_env_limit` (default: 5). The episode timeout covers all
+scenes in an assignment, so increase `--episode-timeout-s` (default: 3600 seconds)
+as needed when increasing `num_envs`. Details:
+[multiple environments](../guides/evaluation.md#单个模拟器的多个环境).
 
 ### VPP2
 
@@ -195,5 +195,6 @@ Do not run simultaneous evaluations against the same output directory.
 
 The supervisor terminates and replaces workers that exceed the configured startup
 timeout. For fatal simulation failures, it restarts the affected worker and
-retries its episode; the direct launcher exposes `--simulator-restart-limit` to
-bound coordinator retries. Repeated failures require checking the simulator logs.
+requeues its unfinished episodes; the direct launcher exposes
+`--simulator-restart-limit` to bound coordinator retries. Repeated failures
+require checking the simulator logs.

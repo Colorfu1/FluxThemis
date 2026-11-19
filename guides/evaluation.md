@@ -71,7 +71,8 @@ episode，也不执行推理。dynamic 和 fixed 调度都按容量分配；fixe
 RoboDojo 的 `_random` 任务受 `sim.scene.clutter_env_limit`（默认 5）限制，
 调度时按 worker 容量与该任务上限的较小值组批。
 
-`episode_timeout_s` 限制整组 assignment 的总运行时间，包括 reset、模型推理、
+`run_evaluation.sh --episode-timeout-s SECONDS`（默认 3600 秒）限制整组
+assignment 的总运行时间，包括 reset、模型推理、
 环境执行和录像收尾。增加 slot 数不会增加超时预算，完成一个 slot 也不会延长
 剩余 slot 的期限。选择容量时应为整组的串行模型请求预留时间。
 
