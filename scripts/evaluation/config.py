@@ -1,5 +1,6 @@
 """Resolve simulation launch settings without starting models or simulators."""
 
+import math
 import os
 import re
 import sys
@@ -165,11 +166,12 @@ def load_config(path, *, mode=None, overrides=None):
     episode_timeout_s = overrides.get('episode_timeout_s')
     if episode_timeout_s is None:
         episode_timeout_s = sim['episode_timeout_s']
+    if (type(episode_timeout_s) not in (int, float)
+            or not math.isfinite(episode_timeout_s) or episode_timeout_s <= 0):
+        raise ValueError('episode_timeout_s must be a finite positive number')
     if is_robolab:
-        if (isinstance(environment.get('num_envs', 1), bool)
-                or not isinstance(environment.get('num_envs', 1), int)
-                or environment.get('num_envs', 1) != 1):
-            raise ValueError('RoboLab num_envs must be 1')
+        if 'num_envs' in environment:
+            raise ValueError('RoboLab has a fixed capacity; remove num_envs')
         if restart_limit != 0 or resume['from_dir'] or evaluation.get(
                 'resume_path'):
             raise ValueError('RoboLab retries and resume are unsupported')

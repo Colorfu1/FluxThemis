@@ -22,7 +22,6 @@ def launch(monkeypatch):
 def scalar_config(tmp_path):
     config = Config.fromfile(ROOT / 'configs/robolab/droid.py')
     evaluation = config.themis.evaluation
-    evaluation.environment.num_envs = 1
     evaluation.episodes_per_task = 1
     path = tmp_path / 'scalar.py'
     config.dump(str(path))
@@ -59,7 +58,7 @@ def test_full_restores_official_cli_scope(launch, tmp_path):
     assert evaluation.task_ids is None
     assert evaluation.episodes_per_task == 1
     assert not evaluation.get('episodes_per_task_overrides')
-    assert evaluation.environment.num_envs == 1
+    assert 'num_envs' not in evaluation.environment
     assert evaluation.environment.simulator_seed == 0
 
 
@@ -134,7 +133,9 @@ def test_invalid_launch_fields(launch, tmp_path, values, message):
         launch.load_config(write_launch(tmp_path, **values))
 
 
-def test_dry_run_freezes_output_and_launch_limits(launch, tmp_path):
+@pytest.mark.parametrize('cli_timeout', [None, 125.5])
+def test_dry_run_freezes_output_and_launch_limits(launch, tmp_path,
+                                                  cli_timeout):
     config = write_launch(
         tmp_path,
         robolab_root='../RoboLab',
@@ -142,15 +143,19 @@ def test_dry_run_freezes_output_and_launch_limits(launch, tmp_path):
         episodes=2,
         episode_timeout_s=300,
         simulator_restart_limit=0)
-    assert launch.main(
-        ['--config', str(config), '--dry-run', '--gpu-ids', '6']) == 0
+    arguments = ['--config', str(config), '--dry-run', '--gpu-ids', '6']
+    if cli_timeout is not None:
+        arguments += ['--episode-timeout-s', str(cli_timeout)]
+    assert launch.main(arguments) == 0
     output, = (tmp_path / 'outputs').iterdir()
     plan = json.loads((output / 'plan.json').read_text())
     cfg = Config.fromfile(str(output / 'config_snapshot.py'))
     assert cfg.themis.evaluation.environment.output_dir == str(output /
                                                                'native')
     args = launch.simulator_arguments(plan)
-    assert args[args.index('--episode-timeout-s') + 1] == '300'
+    assert args.count('--episode-timeout-s') == 1
+    assert float(args[args.index('--episode-timeout-s') +
+                      1]) == (300 if cli_timeout is None else cli_timeout)
     assert args[args.index('--simulator-restart-limit') + 1] == '0'
     assert 'themis.evaluation.environment.robolab_root=' + str(
         tmp_path.parent / 'RoboLab') in args
@@ -635,6 +640,7 @@ def test_direct_distributed_dry_run_reads_actual_evaluation_mapping(launch):
     ['--simulator-restart-limit', '1'],
     ['--resume-from', '/unused/recovery.json'],
     ['--cfg-options', 'themis.evaluation.environment.num_envs=True'],
+    ['--cfg-options', 'themis.evaluation.environment.num_envs=1'],
     ['--cfg-options', 'themis.evaluation.environment.num_envs=2'],
 ])
 def test_direct_distributed_rejects_robolab_incompatible_overrides(
@@ -805,3 +811,10 @@ def test_owned_child_cleanup_errors_remain_visible(launch, tmp_path,
     with pytest.raises(OSError, match=f'owned child {stage} failed'):
         runner.run_logged(['unused'], tmp_path / 'cleanup.log', None, 2)
     assert signals == [(123, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize('value', [0, -1, float('nan'), float('inf'), True])
+def test_invalid_timeout_override_fails_before_launch(launch, tmp_path, value):
+    with pytest.raises(ValueError, match='episode_timeout_s'):
+        launch.load_config(
+            write_launch(tmp_path), overrides={'episode_timeout_s': value})

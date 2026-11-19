@@ -433,7 +433,7 @@ def main(argv=None):
         '--episode-timeout-s',
         type=float,
         help='Time limit in seconds for all scenes in one assignment '
-        '(default: 3600).')
+        '(overrides simulator.episode_timeout_s; default: 3600).')
     parser.add_argument('--cfg-options', nargs='+', action=DictAction)
     parser.add_argument(
         '--output', type=Path, help='Simulator output parent directory.')

@@ -26,7 +26,7 @@ import numpy as np
 from fluxthemis.engines.utils import ENVIRONMENTS
 from fluxthemis.structures import StepResult, TaskSpec
 
-from ..base import BaseEnvironment
+from ..base import SingleEnvironmentAdapter
 from .robolab_metrics import collect_episode_metrics
 
 
@@ -138,7 +138,7 @@ def _single(value, name):
 
 
 @ENVIRONMENTS.register_module()
-class RoboLabEnvironment(BaseEnvironment):
+class RoboLabEnvironment(SingleEnvironmentAdapter):
     """DROID adapter using the official scalar lifecycle.
 
     A worker owns one Isaac application. Consecutive episodes of the same task
@@ -157,7 +157,6 @@ class RoboLabEnvironment(BaseEnvironment):
                  kit_args: str = '',
                  cpu_thread_limit: int | None = None,
                  headless: bool = True,
-                 num_envs: int = 1,
                  camera_keys: Mapping[str, str] | None = None,
                  state_keys: Sequence[str] = ('arm_joint_pos', 'gripper_pos'),
                  renderer: str = 'realtime',
@@ -218,9 +217,6 @@ class RoboLabEnvironment(BaseEnvironment):
                                      cpu_thread_limit, 'cpu_thread_limit'))
         if self.cpu_thread_limit == 0:
             raise ValueError('cpu_thread_limit must be positive')
-        self.num_envs = _nonnegative_integer(num_envs, 'num_envs')
-        if self.num_envs != 1:
-            raise ValueError('num_envs must be 1')
         if not isinstance(headless, bool):
             raise TypeError('headless must be a boolean')
         self.headless = headless
@@ -629,7 +625,7 @@ class RoboLabEnvironment(BaseEnvironment):
             score=score,
             info=info)
 
-    def render(self):
+    def _render(self):
         if self._last_observation is None:
             return None
         return self._last_observation[next(iter(self.camera_keys))].copy()

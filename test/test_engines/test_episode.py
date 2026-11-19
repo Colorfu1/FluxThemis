@@ -37,27 +37,55 @@ def test_episode_jobs_and_execution_contract(capacity):
 @pytest.mark.parametrize('value', [
     np.array([[np.nan]]),
     np.array([[np.inf]]),
-    np.array([[1e300]]), [[True, 1.]], [['1']],
+    np.array([[1e300]]),
+    np.array([[1 + 2j]]), [[True, 1.]], [['1']],
     np.array([[object()]], dtype=object)
 ])
-def test_action_chunk_rejects_invalid_values(value):
+@pytest.mark.parametrize('capacity', [1, 3])
+def test_action_chunk_rejects_invalid_values(value, capacity):
     with pytest.raises((TypeError, ValueError)):
         validate_action_chunk(ActionChunk(value))
 
+    class InvalidPolicy(MockPolicyClient):
+
+        def predict_action(self, observation, context):
+            return ActionChunk(value)
+
+    env = MockVectorEnvironment(capacity, success_after=1)
+    env.setup()
+    jobs = build_episode_jobs([TaskSpec('a')], capacity, 0, 'r')
+    with pytest.raises((TypeError, ValueError)):
+        execute_assignment(
+            env, [InvalidPolicy() for _ in jobs],
+            EpisodeAssignment(jobs),
+            5,
+            None,
+            True,
+            execution_policy=ExecutionPolicy.from_environment(env))
+    assert all(peer.step_count == 0 for peer in env.environments)
+
 
 @pytest.mark.parametrize('capacity', [1, 3])
-def test_action_dimensions_remain_generic_and_each_action_is_observed(capacity):
+def test_action_dimensions_remain_generic_and_each_action_is_observed(
+        capacity):
     value = validate_action_chunk(ActionChunk(np.zeros((4, 29))))
     assert value.shape == (4, 29)
     env = MockVectorEnvironment(capacity, tasks=['a'], success_after=3)
-    policies = [MockPolicyClient(action_dim=7, chunk_size=4)
-                for _ in range(capacity)]
+    policies = [
+        MockPolicyClient(action_dim=7, chunk_size=4) for _ in range(capacity)
+    ]
     observed = [[] for _ in policies]
     for policy, observations in zip(policies, observed):
         policy.observe = observations.append
     env.setup()
     jobs = build_episode_jobs([TaskSpec('a')], capacity, 0, 'r')
-    results = execute_assignment(env, policies, EpisodeAssignment(jobs),
-                                 5, 4, True)
+    results = execute_assignment(
+        env,
+        policies,
+        EpisodeAssignment(jobs),
+        5,
+        4,
+        True,
+        execution_policy=ExecutionPolicy.from_environment(env))
     assert all(result.steps == 3 for result in results)
     assert all(len(observations) == 3 for observations in observed)

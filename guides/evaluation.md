@@ -71,7 +71,8 @@ episode，也不执行推理。dynamic 和 fixed 调度都按容量分配；fixe
 RoboDojo 的 `_random` 任务受 `sim.scene.clutter_env_limit`（默认 5）限制，
 调度时按 worker 容量与该任务上限的较小值组批。
 
-`run_evaluation.sh --episode-timeout-s SECONDS`（默认 3600 秒）限制整组
+`run_evaluation.sh --episode-timeout-s SECONDS` 覆盖 YAML 的
+`simulator.episode_timeout_s`；未配置时默认 3600 秒。该参数限制整组
 assignment 的总运行时间，包括 reset、模型推理、
 环境执行和录像收尾。增加 slot 数不会增加超时预算，完成一个 slot 也不会延长
 剩余 slot 的期限。选择容量时应为整组的串行模型请求预留时间。
@@ -111,7 +112,7 @@ slot 继续运行。如果原生 reset 或动作执行因可恢复异常中断�
   `step_batch(actions)` 和 `finalize_episode(slot, ...)`；slot 必须显式传入。
   只实现 scalar reset/step 的旧环境继承 `SingleEnvironmentAdapter`，由它转换为
   长度为 1 的 batch，并将原 scalar `render()` 改名为 `_render()`。
-  LIBERO、RoboTwin、RoboCasa、Gymnasium 和 mock 已接入。
+  LIBERO、RoboTwin、RoboCasa、RoboLab、Gymnasium 和 mock 已接入。
 - reset 输入是长度为 `num_envs` 的列表，活动 slot 是 `EnvironmentResetRequest`，
   包含任务、episode index、环境 seed 和 case index。输出按 slot 返回
   `EnvironmentReset`，包含 observation 和 info；空 slot 的输入和输出

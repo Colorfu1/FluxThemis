@@ -116,13 +116,12 @@ def test_launcher_forwards_assignment_timeout(tmp_path, monkeypatch,
     assert result.returncode == 0, result.stdout + result.stderr
     output = Path(json.loads(pointer.read_text())['directory'])
     plan = json.loads((output / 'plan.json').read_text())
-    assert plan['episode_timeout_s'] == timeout_s
+    assert plan['local']['episode_timeout_s'] == (3600 if timeout_s is None
+                                                  else timeout_s)
     arguments = launcher.simulator_arguments(plan)
-    timeout_arguments = []
-    assert ('--episode-timeout-s' in arguments) == (timeout_s is not None)
-    if timeout_s is not None:
-        index = arguments.index('--episode-timeout-s')
-        timeout_arguments = arguments[index:index + 2]
+    assert arguments.count('--episode-timeout-s') == 1
+    index = arguments.index('--episode-timeout-s')
+    timeout_arguments = arguments[index:index + 2]
     parsed = distributed.parse_args(
         ['--config', plan['local']['frozen_config'], *timeout_arguments])
     assert parsed.episode_timeout_s == (3600.0

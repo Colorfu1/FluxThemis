@@ -133,7 +133,13 @@ def test_supervised_slot_execution(tmp_path, monkeypatch, capacity,
     monkeypatch.setenv('MUJOCO_EGL_DEVICE_ID', '0')
     monkeypatch.delenv('LOCAL_RANK', raising=False)
     supervisor = worker.SimulatorWorkerSupervisor(
-        str(config), endpoint, 'simulator-worker-0', 'deployment', '0', 10)
+        str(config),
+        endpoint,
+        'simulator-worker-0',
+        'deployment',
+        '0',
+        10,
+        restart_on_failure=False)
     errors = []
 
     def supervise():

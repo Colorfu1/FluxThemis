@@ -5,7 +5,6 @@ themis = dict(
         base_seed=0,
         environment=dict(
             headless=True,
-            num_envs=1,
             output_dir='work_dirs/robolab',
             robolab_root=None,
             simulator_seed=0,

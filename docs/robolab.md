@@ -43,6 +43,8 @@ interpreter/root, model endpoint, GPU, worker count and output directory.
 The default [droid.py](../configs/robolab/droid.py) runs every task for ten
 serial episodes with one simulator worker and one dedicated model service.
 FluxThemis connects to that service through the shared launcher.
+RoboLab capacity is fixed at one scene per worker; omit `num_envs` from the
+environment configuration.
 
 For N GPUs, the companion FluxVLA guide provides a fixed_worker service and
 the corresponding frozen YAML. Set the same GPU list on both sides,
