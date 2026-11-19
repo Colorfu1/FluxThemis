@@ -97,6 +97,8 @@ class ProcessRunner:
             self.env['ROBODOJO_ROOT'] = plan['local']['robodojo_root']
         if plan['local'].get('robotwin_root'):
             self.env['ROBOTWIN_ROOT'] = plan['local']['robotwin_root']
+        if plan['local'].get('robolab_root'):
+            self.env['ROBOLAB_ROOT'] = plan['local']['robolab_root']
         if plan['local'].get('cache'):
             self.env['XDG_CACHE_HOME'] = plan['local']['cache']
         self.env.pop('NPROC_PER_NODE', None)
@@ -179,13 +181,30 @@ class ProcessRunner:
         finally:
             if process:
                 # torchrun workers have their own process groups/sessions.
-                tree.signal_groups(signal.SIGTERM)
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    process.poll()
-                    if not tree.members():
-                        break
-                    time.sleep(.05)
-                else:
-                    tree.signal_groups(signal.SIGKILL)
-                process.wait(timeout=5)
+                try:
+                    if tree is not None:
+                        tree.signal_groups(signal.SIGTERM)
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            process.poll()
+                            if not tree.members():
+                                break
+                            time.sleep(.05)
+                        else:
+                            tree.signal_groups(signal.SIGKILL)
+                finally:
+                    # Popen owns this unreaped child and its new session.
+                    # This also handles failure before ProcessTree exists.
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                    process.wait(timeout=5)
