@@ -15,10 +15,11 @@ from typing import Any, Callable
 
 import numpy as np
 
-from fluxthemis.environments.base import (BaseEnvironment, EnvironmentReset,
+from fluxthemis.environments.base import (BaseEnvironment,
                                           EnvironmentResetRequest)
 from fluxthemis.model_clients.base import BasePolicyClient
-from fluxthemis.structures import (ActionChunk, EpisodeInterruption,
+from fluxthemis.structures import (ActionChunk, CaseRejection,
+                                   EnvironmentReset, EpisodeInterruption,
                                    EpisodeResult, PolicyStop, StepResult,
                                    TaskSpec)
 
@@ -309,10 +310,8 @@ def execute_assignment(
     recorders: list[EpisodeVideoRecorder
                     | None] = [None] * execution_policy.capacity
 
-    def discard_episode(
-            slot: int, job: EpisodeJob, phase: str,
-            result: EnvironmentReset | StepResult | EpisodeInterruption
-    ) -> None:
+    def discard_episode(slot: int, job: EpisodeJob, phase: str,
+                        result: CaseRejection | EpisodeInterruption) -> None:
         if not isinstance(result.info, Mapping):
             raise TypeError('Environment discard info must be a mapping')
         if isinstance(result, EpisodeInterruption):
@@ -362,18 +361,15 @@ def execute_assignment(
                     raise ValueError('Unused reset slots must return None')
                 continue
             job = jobs[slot]
-            if isinstance(reset, EpisodeInterruption):
+            if isinstance(reset, (CaseRejection, EpisodeInterruption)):
                 discard_episode(slot, job, 'reset', reset)
                 continue
             if not isinstance(reset, EnvironmentReset):
                 raise TypeError(
-                    'Active reset slots must return EnvironmentReset or '
-                    'EpisodeInterruption')
+                    'Active reset slots must return EnvironmentReset, '
+                    'CaseRejection or EpisodeInterruption')
             if not isinstance(reset.info, Mapping):
                 raise TypeError('Environment reset info must be a mapping')
-            if reset.rejected:
-                discard_episode(slot, job, 'reset', reset)
-                continue
             client.reset(job.task, job.episode_index, job.policy_seed)
             client.set_episode_id(job.episode_id)
             if on_episode_started is not None:
@@ -412,16 +408,14 @@ def execute_assignment(
                     if transition is not None:
                         raise ValueError('Inactive slots must return None')
                     continue
-                if isinstance(transition, EpisodeInterruption):
+                if isinstance(transition,
+                              (CaseRejection, EpisodeInterruption)):
                     discard_episode(slot, state.job, 'step', transition)
                     continue
                 if not isinstance(transition, StepResult):
                     raise TypeError(
-                        'Active environment slot must return StepResult or '
-                        'EpisodeInterruption')
-                if transition.case_rejected:
-                    discard_episode(slot, state.job, 'step', transition)
-                    continue
+                        'Active environment slot must return StepResult, '
+                        'CaseRejection or EpisodeInterruption')
                 state.advance(transition, max_episode_steps, stop_on_success)
                 recorder = recorders[slot]
                 if recorder is not None:

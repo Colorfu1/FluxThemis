@@ -14,10 +14,10 @@ from fluxthemis.engines.runners.coordinator import \
 from fluxthemis.engines.runners.evaluation import (EvaluationRun,
                                                    EvaluationSettings)
 from fluxthemis.engines.runners.resume import validate_journal
-from fluxthemis.environments import EnvironmentReset, MockVectorEnvironment
+from fluxthemis.environments import MockVectorEnvironment
 from fluxthemis.evaluators import SuccessRateEvaluator
 from fluxthemis.reporters import MockEvaluationReporter
-from fluxthemis.structures import EpisodeInterruption, StepResult
+from fluxthemis.structures import CaseRejection, EpisodeInterruption
 
 
 class _ExecutionEnvironment(MockVectorEnvironment):
@@ -50,21 +50,25 @@ class _ExecutionEnvironment(MockVectorEnvironment):
                 ]) + '\n')
         results = super().reset_batch(requests)
         if self._interrupts('reset'):
-            return self._discard_batch(requests, 'reset')
-        for request, result in zip(requests, results):
+            return self._discard_batch(requests)
+        for slot, (request, result) in enumerate(zip(requests, results)):
             if request is not None and self._reject_at(request) == 'reset':
-                result.rejected = True
-                result.info['reason'] = 'bad initial layout'
+                results[slot] = CaseRejection({
+                    **result.info, 'reason':
+                    'bad initial layout'
+                })
         return results
 
     def step_batch(self, actions):
         if self._interrupts('step'):
-            return self._discard_batch(actions, 'step')
+            return self._discard_batch(actions)
         results = super().step_batch(actions)
-        for request, result in zip(self.requests, results):
+        for slot, (request, result) in enumerate(zip(self.requests, results)):
             if result is not None and self._reject_at(request) == 'step':
-                result.case_rejected = True
-                result.info['reason'] = 'broken physics'
+                results[slot] = CaseRejection({
+                    **result.info, 'reason':
+                    'broken physics'
+                })
         return results
 
     def _interrupts(self, phase):
@@ -72,15 +76,13 @@ class _ExecutionEnvironment(MockVectorEnvironment):
             request is not None and request.environment_case_index == 0
             for request in self.requests)
 
-    def _discard_batch(self, active, phase):
+    def _discard_batch(self, active):
         results = []
         for request, value in zip(self.requests, active):
             if value is None:
                 results.append(None)
             elif request.environment_case_index == 0:
-                results.append(
-                    EnvironmentReset(rejected=True) if phase == 'reset' else
-                    StepResult(observation={}, case_rejected=True))
+                results.append(CaseRejection())
             else:
                 results.append(EpisodeInterruption({'reason': 'partial call'}))
         return results

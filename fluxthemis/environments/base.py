@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Sequence
 
-from fluxthemis.structures import EpisodeInterruption, StepResult, TaskSpec
+from fluxthemis.structures import (CaseRejection, EnvironmentReset,
+                                   EpisodeInterruption, StepResult, TaskSpec)
 
 
 @dataclass(frozen=True)
@@ -15,15 +16,6 @@ class EnvironmentResetRequest:
     episode_index: int
     environment_seed: int | None
     environment_case_index: int | None
-
-
-@dataclass
-class EnvironmentReset:
-    """Initial observation or rejection of one slot's requested case."""
-
-    observation: Any = None
-    info: dict = field(default_factory=dict)
-    rejected: bool = False
 
 
 class BaseEnvironment(ABC):
@@ -61,7 +53,7 @@ class BaseEnvironment(ABC):
     @abstractmethod
     def reset_batch(
         self, requests: list[EnvironmentResetRequest | None]
-    ) -> list[EnvironmentReset | EpisodeInterruption | None]:
+    ) -> list[EnvironmentReset | CaseRejection | EpisodeInterruption | None]:
         """Reset slots, returning observations, rejections or interruptions.
 
         Both lists have num_envs entries in slot order. None marks an unused
@@ -71,12 +63,12 @@ class BaseEnvironment(ABC):
     @abstractmethod
     def step_batch(
         self, actions: list[Any | None]
-    ) -> list[StepResult | EpisodeInterruption | None]:
+    ) -> list[StepResult | CaseRejection | EpisodeInterruption | None]:
         """Advance active slots once, retaining their order.
 
         None marks an inactive slot; freeze or isolate it and return None.
-        Never auto-reset a slot. Reject invalid cases; return an interruption
-        when an unfinished attempt must restart with the same initial case.
+        Never auto-reset a slot. Return CaseRejection for invalid cases or
+        EpisodeInterruption to retry an attempt with the same initial case.
         """
 
     def render(self, slot: int) -> Any | None:
@@ -95,8 +87,8 @@ class SingleEnvironmentAdapter(BaseEnvironment):
     """Bridge legacy scalar reset/step implementations to one batch slot.
 
     Scalar resets may return their existing (observation, info) tuple or an
-    EnvironmentReset rejection or EpisodeInterruption. All callers use the
-    batch methods.
+    EnvironmentReset. Forward CaseRejection and EpisodeInterruption without
+    conversion. All callers use the batch methods.
     """
 
     num_envs = 1
@@ -105,16 +97,18 @@ class SingleEnvironmentAdapter(BaseEnvironment):
     def reset(
         self, task: TaskSpec, episode_index: int, *,
         environment_seed: int | None, environment_case_index: int | None
-    ) -> tuple[Any, dict] | EnvironmentReset | EpisodeInterruption:
+    ) -> (tuple[Any, dict] | EnvironmentReset | CaseRejection |
+          EpisodeInterruption):
         """Reset the legacy scalar environment."""
 
     @abstractmethod
-    def step(self, action: Any) -> StepResult | EpisodeInterruption:
+    def step(self,
+             action: Any) -> StepResult | CaseRejection | EpisodeInterruption:
         """Step the legacy scalar environment."""
 
     def reset_batch(
         self, requests: list[EnvironmentResetRequest | None]
-    ) -> list[EnvironmentReset | EpisodeInterruption | None]:
+    ) -> list[EnvironmentReset | CaseRejection | EpisodeInterruption | None]:
         request, = requests
         if request is None:
             return [None]
@@ -123,13 +117,14 @@ class SingleEnvironmentAdapter(BaseEnvironment):
             request.episode_index,
             environment_seed=request.environment_seed,
             environment_case_index=request.environment_case_index)
-        if not isinstance(result, (EnvironmentReset, EpisodeInterruption)):
+        result_types = (EnvironmentReset, CaseRejection, EpisodeInterruption)
+        if not isinstance(result, result_types):
             result = EnvironmentReset(*result)
         return [result]
 
     def step_batch(
         self, actions: list[Any | None]
-    ) -> list[StepResult | EpisodeInterruption | None]:
+    ) -> list[StepResult | CaseRejection | EpisodeInterruption | None]:
         action, = actions
         return [None if action is None else self.step(action)]
 

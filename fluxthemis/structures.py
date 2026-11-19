@@ -43,6 +43,21 @@ class TaskSpec:
         raise TypeError(f'Cannot create TaskSpec from {type(value).__name__}')
 
 
+@dataclass
+class EnvironmentReset:
+    """Initial observation and context for one slot's requested episode."""
+
+    observation: Any = None
+    info: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CaseRejection:
+    """An invalid case to replace without producing an episode result."""
+
+    info: Mapping[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class EpisodeInterruption:
     """An unfinished attempt to retry with the same episode and initial case.
@@ -65,9 +80,6 @@ class StepResult:
     success: bool | None = None
     info: Mapping[str, Any] = field(default_factory=dict)
     score: float | None = None
-    # Omit this sample from episode results. The runner reports a step
-    # rejection so the coordinator selects a new, unused layout.
-    case_rejected: bool = False
 
 
 @dataclass

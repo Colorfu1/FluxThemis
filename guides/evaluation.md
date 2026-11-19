@@ -114,14 +114,16 @@ slot 继续运行。如果原生 reset 或动作执行因可恢复异常中断�
   LIBERO、RoboTwin、RoboCasa、Gymnasium 和 mock 已接入。
 - reset 输入是长度为 `num_envs` 的列表，活动 slot 是 `EnvironmentResetRequest`，
   包含任务、episode index、环境 seed 和 case index。输出按 slot 返回
-  `EnvironmentReset`，包含 observation、info 和 rejected；空 slot 的输入和输出
+  `EnvironmentReset`，包含 observation 和 info；空 slot 的输入和输出
   都是 `None`。
-- step 输入每 slot 一个动作，输出同长度的 `StepResult` 列表。使用
-  `case_rejected` 标记拒绝；空闲或已结束 slot 的输入和输出都是 `None`。适配器
+- step 输入每 slot 一个动作，正常执行返回 `StepResult`；输出列表与输入等长。
+  空闲或已结束 slot 的输入和输出都是 `None`。适配器
   负责冻结或隔离它们，不能影响健康 episode，也不得隐式 auto-reset。
-- reset 或 step 无法完成、但应保留原 case 重跑时，该 slot 返回
-  `EpisodeInterruption(info)`，不返回观测、reward 或普通结果。它与 rejected
-  互斥；适配器负责确保重跑前清理本次尝试留下的场景和控制状态。
+- reset 和 step 都通过 `CaseRejection(info)` 拒绝 case；无法完成、但应保留
+  原 case 重跑时，返回 `EpisodeInterruption(info)`。这两种类型与正常结果互斥，
+  都不携带观测或 reward。所有结果类型定义在 `fluxthemis.structures`；
+  `EnvironmentReset` 仍可从原有的 `fluxthemis.environments` 或其 `base` 模块导入。
+  适配器负责确保重跑前清理本次尝试留下的场景和控制状态。
 - 唯一执行入口是 `execute_assignment`。返回列表保留 slot 位置，被拒或未使用的
   slot 以及中断的尝试为 `None`，其余为 `EpisodeResult`。
 - 每个 slot 单独结束或丢弃录像。通用录制器调用 `render(slot)`；原生录制器在

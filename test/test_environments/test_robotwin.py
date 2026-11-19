@@ -18,7 +18,7 @@ from fluxthemis.environments import (EnvironmentResetRequest,
                                      RoboTwinEnvironment)
 from fluxthemis.environments.sim.robotwin import CAMERA_KEYS, SEED_BLOCK
 from fluxthemis.model_clients.mock import MockPolicyClient
-from fluxthemis.structures import TaskSpec
+from fluxthemis.structures import CaseRejection, TaskSpec
 
 FAKE_TASK = '''
 import numpy as np
@@ -252,7 +252,7 @@ def test_expert_rejection(runtime, failure):
     runtime.setup()
     base = importlib.import_module('envs._base_task').FakeBaseTask
     base.failure = failure
-    assert reset(runtime).rejected
+    assert isinstance(reset(runtime), CaseRejection)
     assert not runtime._active
     assert any(c[0] == 'close' for c in runtime._env.calls)
 
@@ -262,12 +262,12 @@ def test_error_limit_and_recovery(runtime):
     runtime.setup()
     base = importlib.import_module('envs._base_task').FakeBaseTask
     base.failure = 'error'
-    assert reset(runtime).rejected
+    assert isinstance(reset(runtime), CaseRejection)
     base.failure = None
     reset(runtime, 1)
     assert runtime._consecutive_errors == 0
     base.failure = 'error'
-    assert reset(runtime, 2).rejected
+    assert isinstance(reset(runtime, 2), CaseRejection)
     with pytest.raises(RuntimeError, match='broken expert') as error:
         reset(runtime, 3)
     assert isinstance(error.value.__cause__, ValueError)
@@ -399,7 +399,7 @@ def test_partial_planner_initialization_is_not_reused(runtime, monkeypatch):
         return setup_demo(self, **kwargs)
 
     monkeypatch.setattr(base, 'setup_demo', fail_once)
-    assert reset(runtime).rejected
+    assert isinstance(reset(runtime), CaseRejection)
     assert runtime._env is None
     assert runtime._task_name is None
     reset(runtime, 1)

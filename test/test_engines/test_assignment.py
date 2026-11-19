@@ -13,13 +13,12 @@ from fluxthemis.engines.runners.evaluation import (EvaluationRun,
                                                    EvaluationSettings)
 from fluxthemis.engines.runners.worker import _SimulatorWorker
 from fluxthemis.engines.utils import to_jsonable
-from fluxthemis.environments import (EnvironmentReset, MockEnvironment,
-                                     MockVectorEnvironment)
+from fluxthemis.environments import MockEnvironment, MockVectorEnvironment
 from fluxthemis.evaluators import SuccessRateEvaluator
 from fluxthemis.model_clients import MockPolicyClient
 from fluxthemis.reporters import MockEvaluationReporter
-from fluxthemis.structures import (EpisodeInterruption, PolicyStop, StepResult,
-                                   TaskSpec)
+from fluxthemis.structures import (CaseRejection, EpisodeInterruption,
+                                   PolicyStop, StepResult, TaskSpec)
 from fluxthemis.transports.zmq_protocol import (decode_frame, decode_header,
                                                 empty_payload, encode_frame,
                                                 encode_header)
@@ -273,7 +272,7 @@ def test_runtime_invalid_case_does_not_drop_healthy_progress(capacity):
         def step_batch(self, actions):
             transitions = super().step_batch(actions)
             if actions[0] is not None:
-                transitions[0].case_rejected = True
+                transitions[0] = CaseRejection(transitions[0].info)
             return transitions
 
     environment = InvalidCase(capacity, success_after=3)
@@ -1156,15 +1155,12 @@ def test_report_failure_does_not_commit_completion():
 def test_discarded_reset_does_not_reset_or_infer_its_policy_client(
         capacity, interrupted):
 
-    class RejectedReset(MockVectorEnvironment):
+    class DiscardedReset(MockEnvironment):
 
-        def reset_batch(self, requests):
-            resets = super().reset_batch(requests)
+        def reset(self, *args, **kwargs):
             info = {'reason': 'incomplete reset'}
-            resets[0] = (
-                EpisodeInterruption(info) if interrupted else EnvironmentReset(
-                    rejected=True, info=info))
-            return resets
+            return (EpisodeInterruption(info)
+                    if interrupted else CaseRejection(info))
 
     class Client(MockPolicyClient):
 
@@ -1174,7 +1170,8 @@ def test_discarded_reset_does_not_reset_or_infer_its_policy_client(
             self.was_reset = True
             super().reset(*args, **kwargs)
 
-    environment = RejectedReset(capacity, success_after=1)
+    environment = MockVectorEnvironment(capacity, success_after=1)
+    environment.environments[0] = DiscardedReset()
     environment.setup()
     jobs = _jobs(capacity)
     clients = [Client() for _ in range(capacity)]
@@ -1230,20 +1227,15 @@ def test_discarded_slot_aborts_only_its_recorder(monkeypatch, capacity,
         def abort(self):
             events[self.slot].append('abort')
 
-    class Environment(MockVectorEnvironment):
+    class DiscardedStep(MockEnvironment):
 
-        def step_batch(self, actions):
-            results = super().step_batch(actions)
-            if actions[0] is not None:
-                if interrupted:
-                    results[0] = EpisodeInterruption()
-                else:
-                    results[0].case_rejected = True
-            return results
+        def step(self, action):
+            return EpisodeInterruption() if interrupted else CaseRejection()
 
     monkeypatch.setattr(
         'fluxthemis.engines.runners.episode.EpisodeVideoRecorder', Recorder)
-    environment = Environment(capacity, success_after=2)
+    environment = MockVectorEnvironment(capacity, success_after=2)
+    environment.environments[0] = DiscardedStep()
     environment.setup()
     results = execute_assignment(
         environment, [MockPolicyClient() for _ in range(capacity)],

@@ -18,10 +18,11 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 from fluxthemis.engines.utils import ENVIRONMENTS
-from fluxthemis.structures import (EpisodeInterruption, StepResult, TaskSpec,
+from fluxthemis.structures import (CaseRejection, EnvironmentReset,
+                                   EpisodeInterruption, StepResult, TaskSpec,
                                    positive_integer)
 
-from ..base import BaseEnvironment, EnvironmentReset, EnvironmentResetRequest
+from ..base import BaseEnvironment, EnvironmentResetRequest
 from .robodojo_log_capture import FileLogCapture
 
 ROBODOJO_BENCHMARK = 'RoboDojo'
@@ -706,7 +707,7 @@ class RoboDojoEnvironment(BaseEnvironment):
 
     def reset_batch(
         self, requests: list[EnvironmentResetRequest | None]
-    ) -> list[EnvironmentReset | EpisodeInterruption | None]:
+    ) -> list[EnvironmentReset | CaseRejection | EpisodeInterruption | None]:
         if len(requests) != self.num_envs:
             raise ValueError('RoboDojo reset requires one entry per slot')
         active = [
@@ -782,7 +783,7 @@ class RoboDojoEnvironment(BaseEnvironment):
                 continue
             if slot in rejected:
                 info['reason'] = 'RoboDojo initial layout is unstable'
-                results[slot] = EnvironmentReset(info=info, rejected=True)
+                results[slot] = CaseRejection(info)
                 continue
             converted = robodojo_obs_to_flat(by_slot[slot])
             converted['predicates'] = self._completion_predicates(slot)
@@ -805,7 +806,7 @@ class RoboDojoEnvironment(BaseEnvironment):
 
     def step_batch(
         self, actions: list[Any | None]
-    ) -> list[StepResult | EpisodeInterruption | None]:
+    ) -> list[StepResult | CaseRejection | EpisodeInterruption | None]:
         self._require_episode()
         if len(actions) != self.num_envs:
             raise ValueError('RoboDojo step requires one entry per slot')
@@ -860,15 +861,14 @@ class RoboDojoEnvironment(BaseEnvironment):
                 })
                 continue
             if slot in unstable:
-                results[slot] = StepResult(
-                    observation={},
-                    case_rejected=True,
-                    info={
-                        'environment_case_index':
-                        request.environment_case_index,
-                        'environment_slot': slot,
-                        'reason': 'RoboDojo marked this sample unstable'
-                    })
+                results[slot] = CaseRejection({
+                    'environment_case_index':
+                    request.environment_case_index,
+                    'environment_slot':
+                    slot,
+                    'reason':
+                    'RoboDojo marked this sample unstable'
+                })
                 continue
             terminated = bool(self._env.end_flag[slot])
             success = bool(self._env.success[slot]) if terminated else None

@@ -20,9 +20,9 @@ import numpy as np
 import yaml
 
 from fluxthemis.engines.utils import ENVIRONMENTS
-from fluxthemis.structures import StepResult, TaskSpec
+from fluxthemis.structures import CaseRejection, StepResult, TaskSpec
 
-from ..base import EnvironmentReset, SingleEnvironmentAdapter
+from ..base import SingleEnvironmentAdapter
 
 ROBOTWIN_TASKS = (
     'adjust_bottle', 'beat_block_hammer', 'blocks_ranking_rgb',
@@ -331,8 +331,7 @@ class RoboTwinEnvironment(SingleEnvironmentAdapter):
     def _reject(self, reason, seed):
         _LOG.warning('[RoboTwin] worker=%s rejected seed=%s: %s',
                      self.worker_id, seed, reason)
-        return EnvironmentReset(
-            rejected=True, info=dict(reason=reason, robotwin_seed=seed))
+        return CaseRejection(dict(reason=reason, robotwin_seed=seed))
 
     def _close_expert(self):
         if self._env is None:

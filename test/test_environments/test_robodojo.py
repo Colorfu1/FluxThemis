@@ -14,7 +14,8 @@ from fluxthemis.environments.sim import robodojo
 from fluxthemis.environments.sim.robodojo import RoboDojoEnvironment
 from fluxthemis.evaluators import SuccessRateEvaluator
 from fluxthemis.reporters import MockEvaluationReporter
-from fluxthemis.structures import EpisodeInterruption
+from fluxthemis.structures import (CaseRejection, EnvironmentReset,
+                                   EpisodeInterruption, StepResult)
 
 
 class UnStableError(RuntimeError):
@@ -392,8 +393,8 @@ def test_rejects_only_unstable_reset_slot(batch_environment):
     rejected_slot = len(requests) - 1
     native.unstable_envs = {rejected_slot}
     resets = env.reset_batch(requests)
-    assert [reset.rejected
-            for reset in resets] == [False] * rejected_slot + [True]
+    assert [type(reset) for reset in resets
+            ] == ([EnvironmentReset] * rejected_slot + [CaseRejection])
     assert resets[rejected_slot].info[
         'environment_case_index'] == 10 + rejected_slot
     assert native.abort_calls == [[rejected_slot]]
@@ -412,7 +413,7 @@ def test_unidentified_native_reset_failure_returns_slot_rejections(
 
     monkeypatch.setattr(native, 'reset', unstable)
     resets = env.reset_batch(requests)
-    assert all(reset.rejected for reset in resets)
+    assert all(isinstance(reset, CaseRejection) for reset in resets)
     assert len(resets) == len(requests)
     assert not native.observation_calls
 
@@ -433,7 +434,7 @@ def test_tail_batch_masks_unused_native_lanes(batch_environment):
     inactive = [None] * (len(requests) - 1)
     native.unstable_envs = set(range(1, len(requests)))
     resets = env.reset_batch([requests[0], *inactive])
-    assert not resets[0].rejected
+    assert isinstance(resets[0], EnvironmentReset)
     assert resets[1:] == inactive
     assert native.reset_calls == [[10, *inactive]]
     transitions = env.step_batch([1, *inactive])
@@ -463,10 +464,10 @@ def test_runtime_invalid_layout_freezes_only_its_lane(batch_environment,
 
     monkeypatch.setattr(native, 'take_action_batch', invalidate)
     transitions = env.step_batch([1] * capacity)
-    assert transitions[rejected_slot].case_rejected
-    assert transitions[rejected_slot].success is None
-    assert all(not result.case_rejected
-               for result in transitions[:rejected_slot])
+    assert isinstance(transitions[rejected_slot], CaseRejection)
+    assert all(
+        isinstance(result, StepResult)
+        for result in transitions[:rejected_slot])
     assert native.abort_calls == [[rejected_slot]]
     actions = [None] * capacity
     for slot in range(1, rejected_slot):
@@ -506,15 +507,16 @@ def test_observation_precheck_keeps_healthy_slots_observable(
         env.reset_batch(requests)
         if phase == 'reset' else env.step_batch([1] * len(requests)))
     rejected = results[rejected_slot]
-    assert rejected.rejected if phase == 'reset' else rejected.case_rejected
+    assert isinstance(rejected, CaseRejection)
     assert all(not isinstance(result, EpisodeInterruption)
                for result in results)
     assert native.abort_calls == [[rejected_slot]]
     transitions = env.step_batch(
         [None if flag else 1 for flag in native.end_flag])
     assert transitions[rejected_slot] is None
-    assert all(not result.case_rejected for result in transitions
-               if result is not None)
+    assert all(
+        isinstance(result, StepResult) for result in transitions
+        if result is not None)
 
 
 @pytest.mark.parametrize('failure_at', ['reset', 'step_start', 'step_mid'])
@@ -537,8 +539,7 @@ def test_interrupted_native_call_discards_all_unfinished_slots(
     assert all(
         isinstance(result, EpisodeInterruption) for result in results[:-1])
     rejected = results[-1]
-    assert (rejected.rejected
-            if failure_at == 'reset' else rejected.case_rejected)
+    assert isinstance(rejected, CaseRejection)
     assert native.observation_calls == observations_before
     assert native.reward_calls == rewards_before
     assert native.step_reward_calls == 0
@@ -560,10 +561,11 @@ def test_interrupted_native_call_discards_all_unfinished_slots(
     assert native.initialized
     assert native.pending_controls == [[] for _ in requests]
     assert native.take_action_cnt == [0] * capacity
-    assert all(not reset.rejected for reset in resets)
+    assert all(isinstance(reset, EnvironmentReset) for reset in resets)
     assert not native.video_calls
-    assert all(not result.case_rejected
-               for result in env.step_batch([1] * capacity))
+    assert all(
+        isinstance(result, StepResult)
+        for result in env.step_batch([1] * capacity))
 
 
 def test_native_interruption_preserves_finished_and_unavailable_slots(
@@ -585,7 +587,7 @@ def test_native_interruption_preserves_finished_and_unavailable_slots(
     assert results[0] is None
     assert all(
         isinstance(result, EpisodeInterruption) for result in results[1:4])
-    assert results[4].case_rejected
+    assert isinstance(results[4], CaseRejection)
     assert results[5:] == [None] * 3
     assert native.abort_calls == [[slot] for slot in range(1, 5)]
     assert native.video_calls == [(0, 'success')]
@@ -614,8 +616,8 @@ def test_rejection_during_initial_observation_is_slot_specific(
 
     monkeypatch.setattr(native, 'get_obs_batch', unstable)
     resets = env.reset_batch(requests)
-    assert [reset.rejected
-            for reset in resets] == [False] * rejected_slot + [True]
+    assert [type(reset) for reset in resets
+            ] == ([EnvironmentReset] * rejected_slot + [CaseRejection])
 
 
 def test_policy_stop_freezes_its_slot_without_changing_native_success(
