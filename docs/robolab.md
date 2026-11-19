@@ -104,7 +104,8 @@ The preset does not change action format, execution horizon or success rules.
 
 ## 3. Evaluation protocol and limitations
 
-Only num_envs=1 is supported. One Isaac application belongs to each worker.
+Each worker runs one RoboLab scene; do not set `num_envs`.
+One Isaac application belongs to each worker.
 Within each worker, a task reuses its native environment for the episodes
 assigned to that worker, then closes it. Fixed assignment uses global task-major
 episode numbers: (episode_number - 1) % N, starting at one. Quotas are global
