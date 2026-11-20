@@ -364,11 +364,27 @@ def test_routes_active_slots_and_resets_layouts(batch_environment):
             for reset in resets] == list(range(capacity))
     assert [reset.info['environment_seed']
             for reset in resets] == list(range(17, 17 + capacity))
+    for slot, reset in enumerate(resets):
+        assert reset.info == dict(
+            task_id=requests[slot].task.task_id,
+            episode_index=slot,
+            environment_seed=17 + slot,
+            environment_case_index=10 + slot,
+            layout_index=10 + slot,
+            environment_slot=slot)
     assert all(reset.observation['predicates']['environment_success'] is False
                for reset in resets)
     first = env.step_batch(list(range(1, capacity + 1)))
     assert first[0].terminated and first[0].success
     assert all(not result.terminated for result in first[1:])
+    for slot, result in enumerate(first):
+        assert result.info == dict(
+            task_id=requests[slot].task.task_id,
+            step=1,
+            score=1.0 if slot == 0 else 0.0,
+            environment_case_index=10 + slot,
+            layout_index=10 + slot,
+            environment_slot=slot)
     second = env.step_batch([None] + list(range(2, capacity + 1)))
     assert second[0] is None
     assert [result.info['layout_index']
@@ -385,13 +401,24 @@ def test_routes_active_slots_and_resets_layouts(batch_environment):
     assert env.step_batch(list(range(1, capacity + 1)))[0].terminated
 
 
-def test_rejects_only_unstable_reset_slot(batch_environment):
+@pytest.mark.parametrize('marker', ['unstable_envs', 'end_flag'])
+def test_rejects_only_unstable_reset_slot(batch_environment, monkeypatch,
+                                          marker):
     env, native, requests = batch_environment
     with pytest.raises(ValueError, match='one entry per slot'):
         env.reset_batch(requests[:-1])
     assert not native.reset_calls
     rejected_slot = len(requests) - 1
-    native.unstable_envs = {rejected_slot}
+    reset = native.reset
+
+    def unstable(seed):
+        reset(seed)
+        if marker == 'end_flag':
+            native.end_flag[rejected_slot] = True
+        else:
+            native.unstable_envs.add(rejected_slot)
+
+    monkeypatch.setattr(native, 'reset', unstable)
     resets = env.reset_batch(requests)
     assert [type(reset) for reset in resets
             ] == ([EnvironmentReset] * rejected_slot + [CaseRejection])
@@ -540,6 +567,21 @@ def test_interrupted_native_call_discards_all_unfinished_slots(
         isinstance(result, EpisodeInterruption) for result in results[:-1])
     rejected = results[-1]
     assert isinstance(rejected, CaseRejection)
+    for slot, result in enumerate(results):
+        info = dict(environment_case_index=10 + slot, environment_slot=slot)
+        if failure_at == 'reset':
+            info.update(
+                task_id=requests[slot].task.task_id,
+                episode_index=slot,
+                environment_seed=17 + slot,
+                layout_index=10 + slot,
+                reason=('RoboDojo initial layout is unstable' if slot
+                        == capacity - 1 else 'RoboDojo reset was interrupted'))
+        else:
+            info['reason'] = (
+                'RoboDojo marked this sample unstable' if slot == capacity -
+                1 else 'RoboDojo did not finish executing the batch')
+        assert result.info == info
     assert native.observation_calls == observations_before
     assert native.reward_calls == rewards_before
     assert native.step_reward_calls == 0
@@ -674,14 +716,16 @@ def test_completion_diagnostics_use_each_native_slot(monkeypatch, tmp_path,
         capacity - 1)
 
 
+@pytest.mark.parametrize('shared_video_dir', [False, True])
 def test_native_video_finalizes_and_aborts_each_slot(batch_environment,
-                                                     tmp_path):
+                                                     tmp_path,
+                                                     shared_video_dir):
     env, native, requests = batch_environment
     env.save_videos = True
     env._video_dir = tmp_path / 'videos'
     env._video_dir.mkdir()
-    native.save_dir = tmp_path / 'native'
-    Path(native.save_dir).mkdir()
+    native.save_dir = tmp_path / ('videos' if shared_video_dir else 'native')
+    Path(native.save_dir).mkdir(exist_ok=True)
     env.reset_batch(requests)
     for slot, request in enumerate(requests):
         info = env.finalize_episode(

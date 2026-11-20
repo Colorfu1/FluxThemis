@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from numbers import Integral
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -743,19 +743,9 @@ class RoboDojoEnvironment(BaseEnvironment):
         self._batch_requests = native_requests
         self._batch_inactive = set(range(self._native_num_envs)) - set(active)
         self._video_finalized_slots = set(self._batch_inactive)
-        rejected = set()
-        interrupted = set()
-        try:
-            self._env.reset(seed=layouts)
-        except Exception as exc:
-            if not _is_recoverable_robodojo_case_error(exc):
-                raise
-            rejected.update(self._rejected_reset_slots(active, exc) or active)
-            # Native reset has not finished robot/reward initialization.
-            interrupted.update(active)
-        rejected.update(self._rejected_reset_slots(active))
-        interrupted.difference_update(rejected)
-        self._deactivate_slots(rejected | interrupted)
+        rejected, interrupted = self._run_native_batch(
+            lambda: self._env.reset(seed=layouts), active,
+            self._rejected_reset_slots)
         healthy = [
             slot for slot in active if slot not in rejected | interrupted
         ]
@@ -765,18 +755,16 @@ class RoboDojoEnvironment(BaseEnvironment):
             if callable(getattr(self._env, 'get_score', None)):
                 self._env.get_score()
             by_slot, rejected_observations = self._observe_slots(
-                healthy, 'reset')
+                healthy, self._rejected_reset_slots)
             rejected.update(rejected_observations)
         for slot in active:
             request = requests[slot]
-            info = {
-                'task_id': task.task_id,
-                'episode_index': request.episode_index,
-                'environment_seed': request.environment_seed,
-                'environment_case_index': layouts[slot],
-                'layout_index': layouts[slot],
-                'environment_slot': slot,
-            }
+            info = self._slot_info(slot, layouts[slot])
+            info.update(
+                task_id=task.task_id,
+                episode_index=request.episode_index,
+                environment_seed=request.environment_seed,
+                layout_index=layouts[slot])
             if slot in interrupted:
                 info['reason'] = 'RoboDojo reset was interrupted'
                 results[slot] = EpisodeInterruption(info)
@@ -829,52 +817,37 @@ class RoboDojoEnvironment(BaseEnvironment):
             return results
         # Finished lanes receive no control/reward updates. Native scenes have
         # separate objects and robots, isolating them from active episodes.
-        unstable = set()
-        interrupted = set()
-        try:
-            self._env.take_action_batch(action_dicts, env_idx_list=active)
-        except Exception as exc:
-            if not _is_recoverable_robodojo_case_error(exc):
-                raise
-            unstable.update(self._rejected_step_slots(active, exc) or active)
-            # No transition is valid when native control/reward work stops
-            # partway through the batch. Retry peers after closing/resetting.
-            interrupted.update(active)
-        unstable.update(self._rejected_step_slots(active))
-        interrupted.difference_update(unstable)
-        self._deactivate_slots(unstable | interrupted)
+        rejected, interrupted = self._run_native_batch(
+            lambda: self._env.take_action_batch(
+                action_dicts, env_idx_list=active), active,
+            self._rejected_step_slots)
         observed = [
-            slot for slot in active if slot not in unstable | interrupted
+            slot for slot in active if slot not in rejected | interrupted
         ]
-        by_slot, rejected_observations = self._observe_slots(observed, 'step')
-        unstable.update(rejected_observations)
+        by_slot, rejected_observations = self._observe_slots(
+            observed, self._rejected_step_slots)
+        rejected.update(rejected_observations)
         for slot in active:
             request = self._batch_requests[slot]
+            info = self._slot_info(slot, request.environment_case_index)
             if slot in interrupted:
-                results[slot] = EpisodeInterruption({
-                    'environment_case_index':
-                    request.environment_case_index,
-                    'environment_slot':
-                    slot,
-                    'reason':
-                    'RoboDojo did not finish executing the batch',
-                })
+                info['reason'] = 'RoboDojo did not finish executing the batch'
+                results[slot] = EpisodeInterruption(info)
                 continue
-            if slot in unstable:
-                results[slot] = CaseRejection({
-                    'environment_case_index':
-                    request.environment_case_index,
-                    'environment_slot':
-                    slot,
-                    'reason':
-                    'RoboDojo marked this sample unstable'
-                })
+            if slot in rejected:
+                info['reason'] = 'RoboDojo marked this sample unstable'
+                results[slot] = CaseRejection(info)
                 continue
             terminated = bool(self._env.end_flag[slot])
             success = bool(self._env.success[slot]) if terminated else None
             score = self._current_score(success, slot)
             converted = robodojo_obs_to_flat(by_slot[slot])
             converted['predicates'] = self._completion_predicates(slot)
+            info.update(
+                task_id=request.task.task_id,
+                step=int(self._env.take_action_cnt[slot]),
+                score=score,
+                layout_index=request.environment_case_index)
             results[slot] = StepResult(
                 observation=converted,
                 reward=float(bool(success)) if terminated else 0.0,
@@ -882,20 +855,41 @@ class RoboDojoEnvironment(BaseEnvironment):
                 truncated=False,
                 success=success,
                 score=score,
-                info={
-                    'task_id': request.task.task_id,
-                    'step': int(self._env.take_action_cnt[slot]),
-                    'score': score,
-                    'environment_case_index': request.environment_case_index,
-                    'layout_index': request.environment_case_index,
-                    'environment_slot': slot,
-                })
+                info=info)
             if self.completion_diagnostics:
                 results[slot].info['completion_predicates'] = dict(
                     converted['predicates'])
             if terminated:
                 self._batch_inactive.add(slot)
         return results
+
+    @staticmethod
+    def _slot_info(slot: int, environment_case_index: int) -> dict[str, Any]:
+        return {
+            'environment_case_index': environment_case_index,
+            'environment_slot': slot,
+        }
+
+    def _run_native_batch(
+        self, call: Callable[[], Any], active: Sequence[int],
+        find_bad_slots: Callable[[Sequence[int], BaseException | None],
+                                 list[int]]
+    ) -> tuple[set[int], set[int]]:
+        rejected = set()
+        interrupted = set()
+        try:
+            call()
+        except Exception as exc:
+            if not _is_recoverable_robodojo_case_error(exc):
+                raise
+            rejected.update(find_bad_slots(active, exc) or active)
+            # Native reset/action failures leave initialization or control and
+            # reward work incomplete. Retry peers after closing/resetting.
+            interrupted.update(active)
+        rejected.update(find_bad_slots(active, None))
+        interrupted.difference_update(rejected)
+        self._deactivate_slots(rejected | interrupted)
+        return rejected, interrupted
 
     def _rejected_step_slots(self,
                              active: Sequence[int],
@@ -916,13 +910,13 @@ class RoboDojoEnvironment(BaseEnvironment):
                 end_flags[slot] = True
             self._abort_video(slot)
 
-    def _observe_slots(self, active: list[int],
-                       phase: str) -> tuple[dict[int, Any], set[int]]:
+    def _observe_slots(
+        self, active: list[int],
+        find_bad_slots: Callable[[Sequence[int], BaseException | None],
+                                 list[int]]
+    ) -> tuple[dict[int, Any], set[int]]:
         rejected = set()
         remaining = list(active)
-        rejected_slots = (
-            self._rejected_reset_slots
-            if phase == 'reset' else self._rejected_step_slots)
         while remaining:
             try:
                 observations = self._env.get_obs_batch(env_idx_list=remaining)
@@ -931,7 +925,7 @@ class RoboDojoEnvironment(BaseEnvironment):
                     raise
                 # Each failed capture removes at least one slot. A native
                 # error without slot identities rejects the unobserved slots.
-                rejected.update(rejected_slots(remaining, exc) or remaining)
+                rejected.update(find_bad_slots(remaining, exc) or remaining)
                 self._deactivate_slots(rejected)
                 remaining = [
                     slot for slot in remaining if slot not in rejected
@@ -940,7 +934,7 @@ class RoboDojoEnvironment(BaseEnvironment):
             if len(observations) != len(remaining):
                 raise RuntimeError(
                     'RoboDojo returned an incomplete observation batch')
-            rejected.update(rejected_slots(remaining))
+            rejected.update(find_bad_slots(remaining, None))
             self._deactivate_slots(rejected)
             return dict(zip(remaining, observations)), rejected
         return {}, rejected
@@ -1029,8 +1023,7 @@ class RoboDojoEnvironment(BaseEnvironment):
             path_replacements = {}
             for source in produced:
                 target = self._video_dir / source.name
-                if source != target:
-                    shutil.move(str(source), str(target))
+                shutil.move(str(source), str(target))
                 path_replacements[str(source)] = str(target)
                 final_paths.append(str(target))
         except Exception:
@@ -1201,7 +1194,7 @@ class RoboDojoEnvironment(BaseEnvironment):
         eval_cfg['task_name'] = self._task.task_id
         eval_cfg['num_envs'] = self.num_envs
         eval_cfg['device_id'] = self._device_id
-        eval_cfg['eval_batch'] = True
+        eval_cfg['eval_batch'] = False
         eval_cfg['policy_name'] = 'fluxthemis'
         eval_cfg['additional_info'] = 'fluxthemis'
         eval_cfg['seed'] = self.seed
