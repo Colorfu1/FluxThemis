@@ -170,8 +170,7 @@ def load_config(path, *, mode=None, overrides=None):
             or not math.isfinite(episode_timeout_s) or episode_timeout_s <= 0):
         raise ValueError('episode_timeout_s must be a finite positive number')
     if is_robolab:
-        if 'num_envs' in environment:
-            raise ValueError('RoboLab has a fixed capacity; remove num_envs')
+        integer(environment.get('num_envs', 1), 'RoboLab num_envs')
         if restart_limit != 0 or resume['from_dir'] or evaluation.get(
                 'resume_path'):
             raise ValueError('RoboLab retries and resume are unsupported')

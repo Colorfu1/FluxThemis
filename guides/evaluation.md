@@ -64,7 +64,8 @@ worker 将环境的实际容量通过 ready 消息上报给调度器。`workers-
 episode 分别发送，不要求模型一次推理整个环境 batch。
 
 每次分配最多包含 `num_envs` 个 episode，允许尾批。环境通过 ready
-消息中的 `requires_single_task` 声明是否要求同任务组批；RoboDojo 声明此约束。
+消息中的 `requires_single_task` 声明是否要求同任务组批；RoboDojo 和 RoboLab
+声明此约束。
 例如一个 RoboDojo 任务配额为 25、容量为 10 时，分成 10、10、5；空槽位不启动
 episode，也不执行推理。dynamic 和 fixed 调度都按容量分配；fixed 只从该 worker
 固定配对的 episode 中取 job，重试 job 也可以组批。
@@ -112,7 +113,8 @@ slot 继续运行。如果原生 reset 或动作执行因可恢复异常中断�
   `step_batch(actions)` 和 `finalize_episode(slot, ...)`；slot 必须显式传入。
   只实现 scalar reset/step 的旧环境继承 `SingleEnvironmentAdapter`，由它转换为
   长度为 1 的 batch，并将原 scalar `render()` 改名为 `_render()`。
-  LIBERO、RoboTwin、RoboCasa、RoboLab、Gymnasium 和 mock 已接入。
+  LIBERO、RoboTwin、RoboCasa、Gymnasium 和 mock 使用该适配器。
+  RoboDojo 和 RoboLab 直接实现 batch 接口，支持单个 worker 内的多个场景。
 - reset 输入是长度为 `num_envs` 的列表，活动 slot 是 `EnvironmentResetRequest`，
   包含任务、episode index、环境 seed 和 case index。输出按 slot 返回
   `EnvironmentReset`，包含 observation 和 info；空 slot 的输入和输出

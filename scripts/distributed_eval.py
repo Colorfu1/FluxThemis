@@ -194,8 +194,8 @@ def main(argv=None) -> int:
     evaluation = cfg
     environment = evaluation['environment']
     if environment['type'] == 'RoboLabEnvironment':
-        if 'num_envs' in environment:
-            raise ValueError('RoboLab has a fixed capacity; remove num_envs')
+        from fluxthemis.structures import positive_integer
+        positive_integer(environment.get('num_envs', 1), 'RoboLab num_envs')
         if evaluation.get('resume_path') or args.simulator_restart_limit != 0:
             raise ValueError('RoboLab requires zero retries and no resume')
     if args.workers_per_gpu < 1:

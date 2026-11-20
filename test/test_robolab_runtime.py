@@ -58,19 +58,25 @@ def test_full_restores_official_cli_scope(launch, tmp_path):
     assert evaluation.task_ids is None
     assert evaluation.episodes_per_task == 1
     assert not evaluation.get('episodes_per_task_overrides')
-    assert 'num_envs' not in evaluation.environment
+    assert evaluation.environment.num_envs == 1
     assert evaluation.environment.simulator_seed == 0
 
 
-def test_smoke_scales_to_workers(launch, tmp_path):
+@pytest.mark.parametrize('capacity', [1, 3])
+def test_smoke_scales_to_workers(launch, tmp_path, capacity):
     settings = launch.load_config(
         write_launch(tmp_path, task='MustardInRightBinTask', episodes=9),
         mode='smoke',
-        overrides=dict(gpu_ids='6', workers_per_gpu=2))
+        overrides=dict(
+            gpu_ids='6',
+            workers_per_gpu=2,
+            cfg_options={'themis.evaluation.environment.num_envs': capacity}))
     evaluation = settings['config'].themis.evaluation
     assert evaluation.environment.task_name == 'BananaInBowlTask'
     assert evaluation.task_ids is None
-    assert evaluation.episodes_per_task_overrides == {'BananaInBowlTask': 2}
+    assert evaluation.episodes_per_task_overrides == {
+        'BananaInBowlTask': 2 * capacity
+    }
 
 
 def test_python_task_list_preserves_order(launch, tmp_path):
@@ -133,9 +139,10 @@ def test_invalid_launch_fields(launch, tmp_path, values, message):
         launch.load_config(write_launch(tmp_path, **values))
 
 
+@pytest.mark.parametrize('capacity', [1, 3])
 @pytest.mark.parametrize('cli_timeout', [None, 125.5])
 def test_dry_run_freezes_output_and_launch_limits(launch, tmp_path,
-                                                  cli_timeout):
+                                                  cli_timeout, capacity):
     config = write_launch(
         tmp_path,
         robolab_root='../RoboLab',
@@ -144,12 +151,16 @@ def test_dry_run_freezes_output_and_launch_limits(launch, tmp_path,
         episode_timeout_s=300,
         simulator_restart_limit=0)
     arguments = ['--config', str(config), '--dry-run', '--gpu-ids', '6']
+    arguments += [
+        '--cfg-options', f'themis.evaluation.environment.num_envs={capacity}'
+    ]
     if cli_timeout is not None:
         arguments += ['--episode-timeout-s', str(cli_timeout)]
     assert launch.main(arguments) == 0
     output, = (tmp_path / 'outputs').iterdir()
     plan = json.loads((output / 'plan.json').read_text())
     cfg = Config.fromfile(str(output / 'config_snapshot.py'))
+    assert cfg.themis.evaluation.environment.num_envs == capacity
     assert cfg.themis.evaluation.environment.output_dir == str(output /
                                                                'native')
     args = launch.simulator_arguments(plan)
@@ -627,12 +638,15 @@ def test_proc_members_does_not_adopt_reused_pid(launch, monkeypatch):
     assert tree.members() == {}
 
 
-def test_direct_distributed_dry_run_reads_actual_evaluation_mapping(launch):
+@pytest.mark.parametrize('capacity', [1, 3])
+def test_direct_distributed_dry_run_reads_actual_evaluation_mapping(
+        launch, capacity):
     entry = importlib.import_module('distributed_eval')
     assert entry.main([
         '--config',
         str(ROOT / 'configs/robolab/droid.py'), '--simulator-restart-limit',
-        '0', '--dry-run'
+        '0', '--dry-run', '--cfg-options',
+        f'themis.evaluation.environment.num_envs={capacity}'
     ]) == 0
 
 
@@ -640,8 +654,8 @@ def test_direct_distributed_dry_run_reads_actual_evaluation_mapping(launch):
     ['--simulator-restart-limit', '1'],
     ['--resume-from', '/unused/recovery.json'],
     ['--cfg-options', 'themis.evaluation.environment.num_envs=True'],
-    ['--cfg-options', 'themis.evaluation.environment.num_envs=1'],
-    ['--cfg-options', 'themis.evaluation.environment.num_envs=2'],
+    ['--cfg-options', 'themis.evaluation.environment.num_envs=0'],
+    ['--cfg-options', 'themis.evaluation.environment.num_envs=-1'],
 ])
 def test_direct_distributed_rejects_robolab_incompatible_overrides(
         launch, extra):
