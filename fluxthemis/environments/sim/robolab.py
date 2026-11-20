@@ -470,7 +470,7 @@ class RoboLabEnvironment(BaseEnvironment):
                 recorder.set_hdf5_file(f'run_{self._instance_episode}.hdf5')
                 for slot in range(self.num_envs):
                     recorder.set_episode_index(slot, env_ids=[slot])
-            self._freeze_slots([
+            self._end_unrecorded_slots([
                 slot for slot, request in enumerate(requests)
                 if request is None
             ])
@@ -598,6 +598,15 @@ class RoboLabEnvironment(BaseEnvironment):
         frozen = self._native_frozen()
         frozen[list(slots)] = True
 
+    def _end_unrecorded_slots(self, slots):
+        self._freeze_slots(slots)
+        # Native reset preserves buffers, including its initial-state records.
+        # Empty and externally ended slots have no native export to clear them
+        # before reuse, so discard their recordings explicitly.
+        recorder = self._env.recorder_manager
+        if slots and recorder is not None:
+            recorder.clear(env_ids=slots)
+
     def _slot_value(self, value, name, slot):
         array = _numpy(value)
         if array.size != self.num_envs:
@@ -714,12 +723,7 @@ class RoboLabEnvironment(BaseEnvironment):
         self._require_setup()
         slot = self._slot_index(slot)
         if not self._native_frozen()[slot]:
-            self._freeze_slots([slot])
-            # Native reset preserves recording buffers. External completion
-            # has no native export to clear them before this slot is reused.
-            recorder = self._env.recorder_manager
-            if recorder is not None:
-                recorder.clear(env_ids=[slot])
+            self._end_unrecorded_slots([slot])
         return {}
 
     def _slot_index(self, slot):

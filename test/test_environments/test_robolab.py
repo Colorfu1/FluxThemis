@@ -234,6 +234,11 @@ class _NativeEnvironment:
         self.resets += 1
         self.episode_length_buf[:] = 0
         self.raw = _observation(self.resets, capacity=self.num_envs)
+        # Native record_post_reset appends to buffers without clearing them,
+        # filtering out frozen environments.
+        for slot in range(self.num_envs):
+            if not self._frozen_envs[slot]:
+                self.recorded[slot].append(('initial_state', self.resets))
         return self.raw, {}
 
     def clear_recording(self, env_ids):
@@ -1040,6 +1045,8 @@ def test_tail_batch_freezes_empty_slots_before_recording(batch_environment):
     native = runtime.created[-1][2]
     assert resets[:-1] == inactive
     assert native._frozen_envs.tolist() == [True] * len(inactive) + [False]
+    assert native.cleared == list(range(len(inactive)))
+    assert native.recorded[:-1] == [[] for _ in inactive]
     assert all(env.render(slot) is None for slot in range(len(inactive)))
     actions = [*inactive, np.ones(8)]
     for _ in range(2):
@@ -1050,6 +1057,58 @@ def test_tail_batch_freezes_empty_slots_before_recording(batch_environment):
     assert native.recorded[:-1] == [[] for _ in inactive]
     assert list(native.exported) == [f'demo_{env.num_envs - 1}']
     assert all(result['success'] is None for result in native.results[:-1])
+
+
+def test_empty_slot_reuse_does_not_export_previous_initial_states(
+        runtime, tmp_path):
+    env = RoboLabEnvironment('TaskA', num_envs=2, output_dir=tmp_path)
+    env.setup()
+    try:
+        task = env.tasks()[0]
+        requests = [
+            EnvironmentResetRequest(task, slot, None, None)
+            for slot in range(2)
+        ]
+        env.reset_batch([None, requests[1]])
+        native = runtime.created[-1][2]
+        for _ in range(2):
+            env.step_batch([None, np.ones(8)])
+        native.next_success = True
+        env.step_batch([None, np.ones(8)])
+        assert 'demo_0' not in native.exported
+
+        env.reset_batch(requests)
+        assert runtime.created[-1][2] is native
+        native.next_success = None
+        for _ in range(2):
+            env.step_batch([np.ones(8), np.ones(8)])
+        native.next_success = True
+        results = env.step_batch([np.ones(8), np.ones(8)])
+        assert all(result.success for result in results)
+        for slot in range(2):
+            recording = native.exported[f'demo_{slot}']
+            # Both native resets record an initial state; only this run's
+            # records may precede its three actions.
+            assert recording[:2] == [('initial_state', 3),
+                                     ('initial_state', 4)]
+            assert len(recording) == 5
+            for action in recording[2:]:
+                np.testing.assert_array_equal(action, np.ones(8))
+    finally:
+        env.close()
+
+
+def test_unrecorded_slots_can_end_without_recorder(batch_environment):
+    env, runtime, requests = batch_environment
+    env.reset_batch(requests)
+    native = runtime.created[-1][2]
+    native.recorder_manager = None
+    env.reset_batch([requests[0]] + [None] * (env.num_envs - 1))
+    assert native._frozen_envs.tolist() == [False] + [True] * (
+        env.num_envs - 1)
+    env.finalize_episode(
+        0, success=False, termination_reason='policy_completed')
+    assert native.all_terminated
 
 
 @pytest.mark.parametrize('reason', ['policy_completed', 'max_steps'])
@@ -1069,7 +1128,7 @@ def test_external_completion_freezes_only_its_slot(batch_environment, reason):
     assert all(result.info['wrapper_steps'] == 2 for result in results[1:])
     assert not native.recorded[0]
     assert native.cleared == [0]
-    assert all(len(recording) == 2 for recording in native.recorded[1:])
+    assert all(len(recording) == 4 for recording in native.recorded[1:])
     assert not native.exported and not runtime.metrics_calls
     with pytest.raises(RuntimeError, match='ended'):
         env.step_batch([np.ones(8)] + actions[1:])
@@ -1081,7 +1140,7 @@ def test_external_completion_freezes_only_its_slot(batch_environment, reason):
         env.step_batch(actions)
     native.next_success = True
     env.step_batch(actions)
-    assert all(len(recording) == 3 for recording in native.exported.values())
+    assert all(len(recording) == 5 for recording in native.exported.values())
 
 
 @pytest.mark.parametrize('artifact_step', [1, 2])
@@ -1152,8 +1211,9 @@ def test_private_freeze_contract_is_checked(batch_environment, malformed,
         }[malformed]
     with pytest.raises(RuntimeError, match='_frozen_envs.*boolean tensor'):
         if operation == 'reset':
-            # The native double's reset_eval_state also writes the mask.
+            # Bypass the native double's own use of the invalid mask.
             native.reset_eval_state = lambda: None
+            native.reset = lambda: (native.raw, {})
             env.reset_batch(requests)
         elif operation == 'finalize':
             env.finalize_episode(
