@@ -2,11 +2,13 @@
 
 import json
 import threading
+from contextlib import nullcontext
 from pathlib import Path
 from threading import Event
 from unittest.mock import Mock
 
 import pytest
+from helpers import _coordinator, _jobs, _Socket
 
 from fluxthemis.engines.runners import worker
 from fluxthemis.engines.runners.coordinator import \
@@ -14,10 +16,14 @@ from fluxthemis.engines.runners.coordinator import \
 from fluxthemis.engines.runners.evaluation import (EvaluationRun,
                                                    EvaluationSettings)
 from fluxthemis.engines.runners.resume import validate_journal
+from fluxthemis.engines.runners.worker import _SimulatorWorker
 from fluxthemis.environments import MockVectorEnvironment
 from fluxthemis.evaluators import SuccessRateEvaluator
+from fluxthemis.model_clients.mock import MockPolicyClient
 from fluxthemis.reporters import MockEvaluationReporter
-from fluxthemis.structures import CaseRejection, EpisodeInterruption
+from fluxthemis.structures import CaseRejection, EpisodeInterruption, TaskSpec
+from fluxthemis.transports.zmq_protocol import (decode_frame, decode_header,
+                                                encode_header)
 
 
 class _ExecutionEnvironment(MockVectorEnvironment):
@@ -589,3 +595,109 @@ def test_real_launcher_coordinator_and_worker_exit_bounded(
             simulator_restart_limit=0,
             deployment_id='real-process-test')
     assert {p.pid for p in multiprocessing.active_children()} == previous
+
+
+@pytest.mark.parametrize('capacity', [1, 2, 10])
+@pytest.mark.parametrize('requires_single_task', [False, True])
+def test_worker_coordinator_roundtrip_waits_for_assignment_end(
+        monkeypatch, capacity, requires_single_task):
+    # Exercise the actual wire codec, worker execution and coordinator events
+    # without launching a simulator or connecting a model service.
+    monkeypatch.setattr('fluxthemis.engines.runners.worker._episode_timeout',
+                        lambda timeout: nullcontext())
+    count = 25 if capacity == 10 else 3
+    jobs = _jobs(count, ('a', 'b'))
+    coordinator, slot = _coordinator(capacity, jobs, requires_single_task)
+    socket = _Socket()
+    worker = _SimulatorWorker(
+        config_path='',
+        rollout_endpoint='',
+        worker_id=slot.worker_id,
+        deployment_id='deployment',
+        generation=0,
+        device='0',
+        episode_timeout_s=10,
+        config_overrides={},
+        ready_event=None,
+        stop_received=None)
+    environment = MockVectorEnvironment(capacity, success_after=1)
+    environment.setup()
+    run = EvaluationRun(
+        EvaluationSettings(episodes_per_task=count), SuccessRateEvaluator(),
+        MockEvaluationReporter())
+    with run:
+        run.start([TaskSpec('a'), TaskSpec('b')], len(jobs))
+        batch_sizes = []
+        while coordinator._scheduling_state.pending_jobs:
+            coordinator._dispatch_jobs()
+            socket.incoming = coordinator._worker_router.sent[-1][1:]
+            assignment = worker._receive_assignment(socket)
+            assert 0 < len(assignment.jobs) <= capacity
+            batch_sizes.append(len(assignment.jobs))
+            if requires_single_task:
+                assert len({job.task.task_id for job in assignment.jobs}) == 1
+            socket.sent.clear()
+            deadline = slot.episode_deadline
+            worker._execute_assignment(
+                socket=socket,
+                environment=environment,
+                execution_policy=slot.execution_policy,
+                policy_clients=[MockPolicyClient() for _ in range(capacity)],
+                evaluation_cfg={'max_episode_steps': 10},
+                assignment=assignment,
+                save_videos=False,
+                video_dir=None,
+                video_fps=20)
+            assert decode_header(
+                socket.sent[-1][0])['type'] == 'assignment_end'
+            for frames in socket.sent[:-1]:
+                coordinator._worker_router.incoming = [
+                    slot.routing_id, *frames
+                ]
+                coordinator._receive_worker_message(run)
+                assert not slot.is_idle
+                assert slot.episode_deadline == deadline
+            assert coordinator._active_episode_progress() is None
+            coordinator._worker_router.incoming = [
+                slot.routing_id, *socket.sent[-1]
+            ]
+            coordinator._receive_worker_message(run)
+            assert slot.is_idle
+        expected_sizes = []
+        group_lengths = [count] * 2 if requires_single_task else [count * 2]
+        for length in group_lengths:
+            expected_sizes.extend([capacity] * (length // capacity))
+            expected_sizes.extend([length % capacity] *
+                                  bool(length % capacity))
+        assert batch_sizes == expected_sizes
+        assert coordinator._scheduling_state.is_complete
+        results = coordinator._scheduling_state.ordered_results()
+        assert [r.policy_seed
+                for r in results] == list(range(7, 7 + len(jobs)))
+        assert run.finish(
+            results[-1])['run']['completed_episodes'] == len(jobs)
+
+
+def test_assignment_identity_is_checked_at_worker_boundary():
+    worker = _SimulatorWorker(
+        config_path='',
+        rollout_endpoint='',
+        worker_id='worker',
+        deployment_id='deployment',
+        generation=0,
+        device='0',
+        episode_timeout_s=10,
+        config_overrides={},
+        ready_event=None,
+        stop_received=None)
+    coordinator, slot = _coordinator(1, _jobs(1))
+    coordinator._dispatch_jobs()
+    socket = _Socket()
+    socket.incoming = coordinator._worker_router.sent[-1][1:]
+    header = decode_header(socket.incoming[0])
+    body = decode_frame(socket.incoming[1])
+    assert body['jobs'][0]['episode_id'] == 'run:1'
+    header.update(worker_id='worker', assignment_id='wrong')
+    socket.incoming[0] = encode_header(header.pop('type'), **header)
+    with pytest.raises(RuntimeError, match='assignment_id mismatch'):
+        worker._receive_assignment(socket)

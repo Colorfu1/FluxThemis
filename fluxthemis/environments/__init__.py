@@ -1,4 +1,7 @@
-from .base import (BaseEnvironment, EnvironmentReset, EnvironmentResetRequest,
+from fluxthemis.structures import (CaseRejection, EnvironmentReset,
+                                   EpisodeInterruption)
+
+from .base import (BaseEnvironment, EnvironmentResetRequest,
                    SingleEnvironmentAdapter)
 from .mock import MockEnvironment, MockVectorEnvironment
 from .real import BaseRealRobotEnvironment
@@ -8,9 +11,10 @@ from .sim import (GymnasiumEnvironment, LiberoEnvironment, RoboCasaEnvironment,
 __all__ = [
     'BaseEnvironment',
     'BaseRealRobotEnvironment',
-    'EnvironmentResetRequest',
-    'SingleEnvironmentAdapter',
+    'CaseRejection',
     'EnvironmentReset',
+    'EnvironmentResetRequest',
+    'EpisodeInterruption',
     'GymnasiumEnvironment',
     'LiberoEnvironment',
     'MockEnvironment',
@@ -19,4 +23,5 @@ __all__ = [
     'RoboDojoEnvironment',
     'RoboLabEnvironment',
     'RoboTwinEnvironment',
+    'SingleEnvironmentAdapter',
 ]

@@ -942,7 +942,7 @@ def test_invalid_capacity_rejected_before_runtime(value):
         RoboLabEnvironment(task_name='all', num_envs=value)
 
 
-def test_two_tasks_ten_scalar_episodes_keep_native_rules(environment, runtime):
+def test_two_tasks_ten_episodes_keep_native_rules(environment, runtime):
     outcomes = []
     for task_index in range(2):
         for episode in range(10):
@@ -964,7 +964,7 @@ def test_two_tasks_ten_scalar_episodes_keep_native_rules(environment, runtime):
     assert len({str(item[0]) for item in runtime.metrics_calls}) == 20
 
 
-def test_full_scalar_manifest_keeps_120_times_ten_jobs():
+def test_full_manifest_keeps_120_times_ten_jobs():
     from fluxthemis.engines.runners.episode import build_episode_jobs
     tasks = tuple(TaskSpec(f'task-{i}') for i in range(120))
     jobs = build_episode_jobs(tasks, 10, 0, 'scalar-full')
@@ -988,7 +988,7 @@ def batch_environment(runtime, tmp_path, request):
     env.close()
 
 
-def test_batch_slots_keep_observations_outcomes_and_metrics(batch_environment):
+def test_slots_keep_observations_outcomes_and_metrics(batch_environment):
     env, runtime, requests = batch_environment
     resets = env.reset_batch(requests)
     native = runtime.created[-1][2]
@@ -1038,7 +1038,8 @@ def test_batch_slots_keep_observations_outcomes_and_metrics(batch_environment):
     assert len(runtime.metrics_calls) == env.num_envs
 
 
-def test_tail_batch_freezes_empty_slots_before_recording(batch_environment):
+def test_partial_assignment_freezes_empty_slots_before_recording(
+        batch_environment):
     env, runtime, requests = batch_environment
     inactive = [None] * (env.num_envs - 1)
     resets = env.reset_batch([*inactive, requests[-1]])

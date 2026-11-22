@@ -48,7 +48,8 @@ def _config(capacity):
 
 
 @pytest.mark.parametrize('dry_run', [False, True])
-def test_launcher_accepts_batch_configuration(tmp_path, dry_run):
+def test_launcher_accepts_environment_capacity_configuration(
+        tmp_path, dry_run):
     env = dict(os.environ)
     env['PYTHONPATH'] = str(ROOT)
     env.pop('CUDA_VISIBLE_DEVICES', None)

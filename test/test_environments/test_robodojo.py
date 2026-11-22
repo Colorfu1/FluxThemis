@@ -456,7 +456,7 @@ def test_scores_are_slot_specific(batch_environment):
             for item in transitions] == [score / 100 for score in scores]
 
 
-def test_tail_batch_masks_unused_native_lanes(batch_environment):
+def test_partial_assignment_masks_unused_native_slots(batch_environment):
     env, native, requests = batch_environment
     inactive = [None] * (len(requests) - 1)
     native.unstable_envs = set(range(1, len(requests)))

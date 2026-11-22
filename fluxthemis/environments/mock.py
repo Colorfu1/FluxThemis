@@ -133,12 +133,20 @@ class MockVectorEnvironment(BaseEnvironment):
         ]
 
     def render(self, slot: int) -> Any | None:
+        self._require_slot(slot)
         return self.environments[slot].render(0)
 
     def finalize_episode(self, slot: int, *, success: bool,
                          termination_reason: str) -> dict:
+        self._require_slot(slot)
         return self.environments[slot].finalize_episode(
             0, success=success, termination_reason=termination_reason)
+
+    def _require_slot(self, slot: int) -> None:
+        if type(slot) is not int or not 0 <= slot < self.num_envs:
+            raise ValueError(
+                f'MockVectorEnvironment slot must be an integer in '
+                f'[0, {self.num_envs})')
 
     def close(self) -> None:
         for environment in self.environments:

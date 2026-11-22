@@ -42,9 +42,9 @@ class BaseEnvironment(ABC):
     def setup(self) -> None:
         """Allocate simulator or hardware resources."""
 
+    @abstractmethod
     def tasks(self) -> Sequence[TaskSpec]:
         """Return the tasks available for evaluation."""
-        raise NotImplementedError
 
     def task_capacity(self, task: TaskSpec) -> int:
         """Return this task's assignment capacity after setup."""
@@ -77,7 +77,18 @@ class BaseEnvironment(ABC):
     @abstractmethod
     def finalize_episode(self, slot: int, *, success: bool,
                          termination_reason: str) -> dict:
-        """Flush slot artifacts without stepping or changing its outcome."""
+        """Finalize a naturally or externally ended episode in this slot.
+
+        Called for natural completion, PolicyStop and max_episode_steps.
+        Only perform cleanup: do not advance simulation or change the episode
+        outcome. Return additional information, such as video_paths.
+
+        When termination_reason is 'case_rejected' or 'interrupted', discard
+        this slot's recordings and return an empty dictionary.
+
+        Multi-scene adapters must freeze this slot here. Subsequent actions
+        for the slot will be None.
+        """
 
     def close(self) -> None:
         """Release resources. Implementations should make this idempotent."""
@@ -109,7 +120,10 @@ class SingleEnvironmentAdapter(BaseEnvironment):
     def reset_batch(
         self, requests: list[EnvironmentResetRequest | None]
     ) -> list[EnvironmentReset | CaseRejection | EpisodeInterruption | None]:
-        request, = requests
+        if len(requests) != 1:
+            raise ValueError(
+                'SingleEnvironmentAdapter expects exactly one slot')
+        request = requests[0]
         if request is None:
             return [None]
         result = self.reset(
@@ -125,7 +139,10 @@ class SingleEnvironmentAdapter(BaseEnvironment):
     def step_batch(
         self, actions: list[Any | None]
     ) -> list[StepResult | CaseRejection | EpisodeInterruption | None]:
-        action, = actions
+        if len(actions) != 1:
+            raise ValueError(
+                'SingleEnvironmentAdapter expects exactly one slot')
+        action = actions[0]
         return [None if action is None else self.step(action)]
 
     def render(self, slot: int) -> Any | None:
