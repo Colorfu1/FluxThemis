@@ -1,6 +1,7 @@
+from test.test_engines.helpers import make_jobs
+
 import numpy as np
 import pytest
-from helpers import _jobs
 
 from fluxthemis.engines.runners.assignment import (EpisodeAssignment,
                                                    ExecutionPolicy)
@@ -100,7 +101,7 @@ def test_shared_execution_preserves_slot_identity_and_chunk_progress(capacity):
     for index, slot in enumerate(environment.environments):
         slot.success_after = index * 2 + 1
     environment.setup()
-    jobs = _jobs(capacity)
+    jobs = make_jobs(capacity)
     clients = [
         MockPolicyClient(chunk_size=i + 1, fill_value=i)
         for i in range(capacity)
@@ -136,7 +137,7 @@ def test_horizon_and_max_steps_apply_per_slot():
     environment.setup()
     results = execute_assignment(
         environment, [MockPolicyClient(chunk_size=8) for _ in range(2)],
-        EpisodeAssignment(_jobs(2)),
+        EpisodeAssignment(make_jobs(2)),
         5,
         2,
         True,
@@ -171,7 +172,7 @@ def test_policy_completion_without_actions_finalizes_each_slot(capacity):
     environment = Environment(capacity, success_after=None)
     environment.setup()
     clients = [Client() for _ in range(capacity)]
-    jobs = _jobs(capacity)
+    jobs = make_jobs(capacity)
     results = execute_assignment(
         environment,
         clients,
@@ -232,7 +233,7 @@ def test_policy_stop_keeps_peer_running_and_uses_executed_step_counts():
     environment.setup()
     results = execute_assignment(
         environment, [Client(), MockPolicyClient()],
-        EpisodeAssignment(_jobs(2)),
+        EpisodeAssignment(make_jobs(2)),
         10,
         2,
         True,
@@ -265,7 +266,7 @@ def test_finalization_always_receives_its_slot(capacity):
     environment.finalize_episode = finalize_episode
     results = execute_assignment(
         environment, [MockPolicyClient() for _ in range(capacity)],
-        EpisodeAssignment(_jobs(capacity)),
+        EpisodeAssignment(make_jobs(capacity)),
         10,
         None,
         True,
@@ -293,7 +294,7 @@ def test_score_validation_and_sticky_success_are_shared(capacity):
     environment.setup()
     results = execute_assignment(
         environment, [MockPolicyClient() for _ in range(capacity)],
-        EpisodeAssignment(_jobs(capacity)),
+        EpisodeAssignment(make_jobs(capacity)),
         10,
         None,
         False,
@@ -319,7 +320,7 @@ def test_partial_results_survive_later_slot_failure():
         execute_assignment(
             environment, [MockPolicyClient(),
                           FailingClient(chunk_size=1)],
-            EpisodeAssignment(_jobs(2)),
+            EpisodeAssignment(make_jobs(2)),
             10,
             None,
             True,
@@ -343,7 +344,7 @@ def test_runtime_invalid_case_does_not_drop_healthy_progress(capacity):
 
     environment = InvalidCase(capacity, success_after=3)
     environment.setup()
-    jobs = _jobs(capacity)
+    jobs = make_jobs(capacity)
     clients = [MockPolicyClient(chunk_size=1) for _ in range(capacity)]
     rejected, completed = [], []
     results = execute_assignment(
@@ -391,7 +392,7 @@ def test_interruption_keeps_completed_results_and_discards_attempt_metrics(
     for peer in environment.environments[:-1]:
         peer.success_after = 1
     environment.setup()
-    jobs = _jobs(capacity)
+    jobs = make_jobs(capacity)
     clients = [MockPolicyClient(chunk_size=1) for _ in jobs]
     finished, interrupted = [], []
     policy = ExecutionPolicy.from_environment(environment)
@@ -441,7 +442,7 @@ def test_nonfinite_score_is_rejected(capacity):
     with pytest.raises(ValueError, match='non-finite'):
         execute_assignment(
             environment, [MockPolicyClient() for _ in range(capacity)],
-            EpisodeAssignment(_jobs(capacity)),
+            EpisodeAssignment(make_jobs(capacity)),
             10,
             None,
             True,
@@ -465,7 +466,7 @@ def test_execute_assignment_reuses_declared_capabilities(
 
     monkeypatch.setattr(environment, 'tasks', read_capabilities_again)
     monkeypatch.setattr(environment, 'task_capacity', read_capabilities_again)
-    jobs = _jobs(limit + 1, ('limited', ))
+    jobs = make_jobs(limit + 1, ('limited', ))
     clients = [MockPolicyClient() for _ in range(capacity)]
     with pytest.raises(ValueError, match='exceeds'):
         execute_assignment(
@@ -509,7 +510,7 @@ def test_single_slot_environment_rejects_larger_assignment():
         execute_assignment(
             environment,
             [MockPolicyClient(), MockPolicyClient()],
-            EpisodeAssignment(_jobs(2)),
+            EpisodeAssignment(make_jobs(2)),
             10,
             None,
             True,
@@ -559,7 +560,7 @@ def test_video_finishes_or_aborts_each_slot(monkeypatch, capacity, fail):
     def execute():
         return execute_assignment(
             environment, [MockPolicyClient() for _ in range(capacity)],
-            EpisodeAssignment(_jobs(capacity)),
+            EpisodeAssignment(make_jobs(capacity)),
             10,
             None,
             True,
@@ -587,7 +588,7 @@ def test_unused_slots_do_not_reset_or_infer(capacity):
     results = execute_assignment(
         environment,
         clients,
-        EpisodeAssignment(_jobs(1)),
+        EpisodeAssignment(make_jobs(1)),
         5,
         None,
         True,
@@ -623,7 +624,7 @@ def test_discarded_reset_does_not_reset_or_infer_its_policy_client(
     environment = MockVectorEnvironment(capacity, success_after=1)
     environment.environments[0] = DiscardedReset()
     environment.setup()
-    jobs = _jobs(capacity)
+    jobs = make_jobs(capacity)
     clients = [Client() for _ in range(capacity)]
     rejected, interruptions, started = [], [], []
     results = execute_assignment(
@@ -689,7 +690,7 @@ def test_discarded_slot_aborts_only_its_recorder(monkeypatch, capacity,
     environment.setup()
     results = execute_assignment(
         environment, [MockPolicyClient() for _ in range(capacity)],
-        EpisodeAssignment(_jobs(capacity)),
+        EpisodeAssignment(make_jobs(capacity)),
         5,
         None,
         True,

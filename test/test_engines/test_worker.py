@@ -4,11 +4,11 @@ import json
 import threading
 from contextlib import nullcontext
 from pathlib import Path
+from test.test_engines.helpers import RouterSocket, make_coordinator, make_jobs
 from threading import Event
 from unittest.mock import Mock
 
 import pytest
-from helpers import _coordinator, _jobs, _Socket
 
 from fluxthemis.engines.runners import worker
 from fluxthemis.engines.runners.coordinator import \
@@ -606,9 +606,9 @@ def test_worker_coordinator_roundtrip_waits_for_assignment_end(
     monkeypatch.setattr('fluxthemis.engines.runners.worker._episode_timeout',
                         lambda timeout: nullcontext())
     count = 25 if capacity == 10 else 3
-    jobs = _jobs(count, ('a', 'b'))
-    coordinator, slot = _coordinator(capacity, jobs, requires_single_task)
-    socket = _Socket()
+    jobs = make_jobs(count, ('a', 'b'))
+    coordinator, slot = make_coordinator(capacity, jobs, requires_single_task)
+    socket = RouterSocket()
     worker = _SimulatorWorker(
         config_path='',
         rollout_endpoint='',
@@ -690,9 +690,9 @@ def test_assignment_identity_is_checked_at_worker_boundary():
         config_overrides={},
         ready_event=None,
         stop_received=None)
-    coordinator, slot = _coordinator(1, _jobs(1))
+    coordinator, slot = make_coordinator(1, make_jobs(1))
     coordinator._dispatch_jobs()
-    socket = _Socket()
+    socket = RouterSocket()
     socket.incoming = coordinator._worker_router.sent[-1][1:]
     header = decode_header(socket.incoming[0])
     body = decode_frame(socket.incoming[1])

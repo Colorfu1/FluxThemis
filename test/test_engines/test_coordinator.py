@@ -1,5 +1,6 @@
+from test.test_engines.helpers import RouterSocket, make_coordinator, make_jobs
+
 import pytest
-from helpers import _coordinator, _jobs, _Socket
 
 from fluxthemis.engines.runners.assignment import (EpisodeAssignment,
                                                    ExecutionPolicy)
@@ -23,9 +24,9 @@ from fluxthemis.transports.zmq_protocol import (empty_payload, encode_frame,
 @pytest.mark.parametrize('capacity', [1, 3])
 def test_rejection_replaces_layout_before_pending_jobs(phase, capacity,
                                                        capsys):
-    jobs = _jobs(capacity + 1)
+    jobs = make_jobs(capacity + 1)
     job = jobs[0]
-    coordinator, slot = _coordinator(capacity, jobs, active=True)
+    coordinator, slot = make_coordinator(capacity, jobs, active=True)
     coordinator.simulator_restart_limit = 0
     state = coordinator._scheduling_state
     state.started_episode_ids.add(job.episode_id)
@@ -59,8 +60,8 @@ def test_rejection_replaces_layout_before_pending_jobs(phase, capacity,
 
 @pytest.mark.parametrize('capacity', [1, 3])
 def test_reconnecting_worker_requeues_only_unfinished_episodes(capacity):
-    jobs = _jobs(capacity)
-    coordinator, slot = _coordinator(capacity, jobs, active=True)
+    jobs = make_jobs(capacity)
+    coordinator, slot = make_coordinator(capacity, jobs, active=True)
     state = coordinator._scheduling_state
     job = jobs[-1]
     state.started_episode_ids.add(job.episode_id)
@@ -96,7 +97,7 @@ def test_reconnecting_worker_requeues_only_unfinished_episodes(capacity):
 @pytest.mark.parametrize('phase', [None, 'unknown', True])
 def test_invalid_rejection_phase_is_rejected(phase):
     jobs = build_episode_jobs([TaskSpec('task')], 1, 7, 'run')
-    coordinator, slot = _coordinator(1, jobs, active=True)
+    coordinator, slot = make_coordinator(1, jobs, active=True)
     coordinator._worker_router.incoming = [
         slot.routing_id,
         encode_header(
@@ -142,7 +143,7 @@ def _receive_event(coordinator,
 def test_dispatch_groups_jobs_by_declared_task_limit(strict):
     tasks = [TaskSpec('stack_bowls_random'), TaskSpec('stack_bowls')]
     jobs = build_episode_jobs(tasks, 25, 7, 'run')
-    coordinator, slot = _coordinator(
+    coordinator, slot = make_coordinator(
         8,
         jobs,
         requires_single_task=True,
@@ -171,7 +172,8 @@ def test_dispatch_groups_jobs_by_declared_task_limit(strict):
     'another': 2
 }])
 def test_worker_restart_rejects_changed_task_capacities(task_capacities):
-    coordinator, slot = _coordinator(8, _jobs(1), task_capacities={'task': 5})
+    coordinator, slot = make_coordinator(
+        8, make_jobs(1), task_capacities={'task': 5})
     coordinator._replace_worker_connection(
         slot, routing_id=b'new', generation=1)
     with pytest.raises(
@@ -189,8 +191,8 @@ def test_worker_restart_rejects_changed_task_capacities(task_capacities):
 
 
 def test_retried_jobs_fill_worker_capacity():
-    jobs = _jobs(4)
-    coordinator, slot = _coordinator(3, jobs)
+    jobs = make_jobs(4)
+    coordinator, slot = make_coordinator(3, jobs)
     coordinator._dispatch_jobs()
     coordinator._replace_worker_connection(
         slot, routing_id=b'replacement', generation=1)
@@ -203,8 +205,8 @@ def test_retried_jobs_fill_worker_capacity():
 
 
 def test_retry_budget_is_per_episode_not_worker_generation():
-    jobs = _jobs(4)
-    coordinator, slot = _coordinator(1, jobs)
+    jobs = make_jobs(4)
+    coordinator, slot = make_coordinator(1, jobs)
     coordinator.simulator_restart_limit = 1
     for index, job in enumerate(jobs):
         slot.assignment = EpisodeAssignment((job, ))
@@ -222,8 +224,8 @@ def test_retry_budget_is_per_episode_not_worker_generation():
 
 
 def test_duplicate_result_and_early_assignment_end_are_rejected():
-    jobs = _jobs(2)
-    coordinator, slot = _coordinator(2, jobs)
+    jobs = make_jobs(2)
+    coordinator, slot = make_coordinator(2, jobs)
     coordinator._dispatch_jobs()
     slot.completed_episode_ids.add(jobs[0].episode_id)
     with pytest.raises(RuntimeError, match='unassigned episode'):
@@ -252,8 +254,8 @@ def test_duplicate_result_and_early_assignment_end_are_rejected():
                           ('episode_interrupted', 'reset'),
                           ('episode_interrupted', 'step')])
 def test_terminal_episode_rejects_further_events(capacity, event, phase):
-    jobs = _jobs(capacity)
-    coordinator, slot = _coordinator(capacity, jobs)
+    jobs = make_jobs(capacity)
+    coordinator, slot = make_coordinator(capacity, jobs)
     coordinator._dispatch_jobs()
     env = MockVectorEnvironment(capacity, success_after=1)
     env.setup()
@@ -315,8 +317,8 @@ def test_terminal_episode_rejects_further_events(capacity, event, phase):
 
 @pytest.mark.parametrize('capacity', [1, 3])
 def test_reconnected_worker_deduplicates_start_and_completes_retry(capacity):
-    jobs = _jobs(capacity)
-    coordinator, slot = _coordinator(capacity, jobs)
+    jobs = make_jobs(capacity)
+    coordinator, slot = make_coordinator(capacity, jobs)
     coordinator._dispatch_jobs()
     reporter = MockEvaluationReporter()
     with EvaluationRun(EvaluationSettings(), SuccessRateEvaluator(),
@@ -367,8 +369,8 @@ def test_reconnected_worker_deduplicates_start_and_completes_retry(capacity):
 @pytest.mark.parametrize('phase', ['reset', 'step'])
 def test_interruption_requeues_same_jobs_without_restart_or_duplicate_start(
         capacity, phase):
-    jobs = _jobs(capacity + 1)
-    coordinator, slot = _coordinator(capacity, jobs)
+    jobs = make_jobs(capacity + 1)
+    coordinator, slot = make_coordinator(capacity, jobs)
     coordinator.simulator_restart_limit = 0
     coordinator._dispatch_jobs()
     original = slot.assignment
@@ -429,8 +431,8 @@ def test_interruption_requeues_same_jobs_without_restart_or_duplicate_start(
 
 
 def test_old_assignment_and_generation_messages_cannot_complete_a_retry():
-    jobs = _jobs(2)
-    coordinator, slot = _coordinator(2, jobs)
+    jobs = make_jobs(2)
+    coordinator, slot = make_coordinator(2, jobs)
     coordinator._dispatch_jobs()
     original = slot.assignment
     coordinator._replace_worker_connection(
@@ -467,8 +469,8 @@ def test_report_failure_does_not_commit_completion():
                 raise RuntimeError('report unavailable')
             return super().report_evaluation(event_type, payload)
 
-    jobs = _jobs(1)
-    coordinator, slot = _coordinator(2, jobs)
+    jobs = make_jobs(1)
+    coordinator, slot = make_coordinator(2, jobs)
     coordinator._dispatch_jobs()
     env = MockVectorEnvironment(2, success_after=1)
     env.setup()
@@ -501,13 +503,13 @@ def test_report_failure_does_not_commit_completion():
 @pytest.mark.parametrize('requires_single_task', [False, True])
 def test_strict_scheduling_uses_capacity_and_fixed_worker_pairing(
         capacity, requires_single_task):
-    jobs = _jobs(capacity + 1, ('a', 'b'))
+    jobs = make_jobs(capacity + 1, ('a', 'b'))
     coordinator = DistributedEvaluationCoordinator(
         'inproc://strict-assignments', 2, deployment_id='deployment')
     coordinator._strict_worker_assignment = True
     state = coordinator._scheduling_state = _SchedulingState.from_jobs(jobs)
     state.restart_counts_by_episode_id = {job.episode_id: 1 for job in jobs}
-    coordinator._worker_router = _Socket()
+    coordinator._worker_router = RouterSocket()
     for index in range(2):
         slot = _WorkerSlot(
             f'simulator-worker-{index}',

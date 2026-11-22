@@ -1,5 +1,6 @@
+from test.test_engines.helpers import make_jobs
+
 import pytest
-from helpers import _jobs
 
 from fluxthemis.engines.runners.assignment import (EpisodeAssignment,
                                                    ExecutionPolicy)
@@ -17,8 +18,8 @@ def test_capacity_validation(value):
 
 def test_capacity_and_declared_task_capability_validation():
     policy = ExecutionPolicy(2)
-    policy.validate_assignment(EpisodeAssignment(_jobs(1)))
-    mixed = EpisodeAssignment(_jobs(1, ('a', 'b')))
+    policy.validate_assignment(EpisodeAssignment(make_jobs(1)))
+    mixed = EpisodeAssignment(make_jobs(1, ('a', 'b')))
     policy.validate_assignment(mixed)
     with pytest.raises(ValueError, match='one task'):
         ExecutionPolicy(
@@ -26,7 +27,7 @@ def test_capacity_and_declared_task_capability_validation():
     with pytest.raises(ValueError, match='exceeds worker capacity'):
         ExecutionPolicy(1).validate_assignment(mixed)
     with pytest.raises(ValueError, match='duplicate'):
-        EpisodeAssignment([_jobs(1)[0]] * 2)
+        EpisodeAssignment([make_jobs(1)[0]] * 2)
     with pytest.raises(ValueError, match='sizes differ'):
         policy.validate_assignment(mixed, [MockPolicyClient()])
     with pytest.raises(ValueError, match='own policy client'):

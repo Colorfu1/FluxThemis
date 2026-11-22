@@ -6,7 +6,7 @@ from fluxthemis.structures import TaskSpec
 from fluxthemis.transports.zmq_protocol import encode_frame
 
 
-class _Socket:
+class RouterSocket:
 
     def __init__(self, incoming=None):
         self.incoming = incoming
@@ -19,22 +19,22 @@ class _Socket:
         self.sent.append(frames)
 
 
-def _jobs(count, tasks=('task', )):
+def make_jobs(count, tasks=('task', )):
     return build_episode_jobs([TaskSpec(t) for t in tasks], count, 7, 'run')
 
 
-def _coordinator(capacity,
-                 jobs,
-                 requires_single_task=False,
-                 task_capacities=None,
-                 *,
-                 active=False):
+def make_coordinator(capacity,
+                     jobs,
+                     requires_single_task=False,
+                     task_capacities=None,
+                     *,
+                     active=False):
     coordinator = DistributedEvaluationCoordinator(
         'inproc://assignments', 1, deployment_id='deployment')
     coordinator._scheduling_state = _SchedulingState.from_jobs(jobs)
     slot = _WorkerSlot('simulator-worker-0', b'worker', 0, '0')
     coordinator._worker_slots[slot.worker_id] = slot
-    coordinator._worker_router = _Socket()
+    coordinator._worker_router = RouterSocket()
     tasks = {job.task.task_id: job.task for job in jobs}
     coordinator._mark_worker_ready(
         slot,
